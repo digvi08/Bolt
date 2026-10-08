@@ -45,6 +45,22 @@ These environment variables are explicit permissions, not defaults. No external 
 
 Pass a `SQLiteTaskStore` to `AgentRuntime`, `AbilityRouter`, `AgentExecutionLoop`, or `BrowserTaskRunner` to enable durable task/action journals. `SQLiteTaskStore()` stores data at `%LOCALAPPDATA%\bolt\agent-state.sqlite3` on Windows, `$XDG_DATA_HOME/bolt/agent-state.sqlite3` when configured, or `~/.local/share/bolt/agent-state.sqlite3` otherwise. Pass an explicit database path to override it, or `":memory:"` for a deliberately ephemeral store (for example, isolated tests). The runtime does not silently create a store when `state_store` is omitted. These low-level constructors are useful for isolated tests and in-process integrations; they do not acquire application process ownership on their own. For production processes that share a durable database, use `AgentApplication` so the exclusive process lock and lifecycle are held around all components. Playwright has no restart-safe independent reconciliation capability; browser actions left uncertain remain blocked unless an application supplies a separately validated reconciler.
 
+## Durable Operator Approvals
+
+The approval system decouples approval from execution, enabling operators to review and authorize actions asynchronously:
+
+- **Persistent approval records**: SQLite-persisted approval lifecycle with status progression (PENDING → APPROVED|DENIED → CONSUMED|EXPIRED)
+- **Action fingerprinting**: SHA256 hash of task, action, caller, ability, and parameters prevents approval tampering and ensures distinct action variants require separate approvals
+- **Expiration windows**: 15-minute default TTL with timezone-aware clock; expired approvals auto-downgrade and cannot be consumed
+- **Idempotent claim**: Concurrent runtime claims race safely; only one succeeds and transitions APPROVED → CONSUMED; others see stale state
+- **Dual-path approval**: Runtime distinguishes synchronous denial (interactive CLI) from deferred pending (durable provider) and avoids replanning during approval window
+- **Service-layer operations**: `list_approvals()`, `get_approval()`, `approve_approval()`, `deny_approval()` with task resumption after approval
+- **API endpoints**: `GET /approvals`, `GET /approvals/{id}`, `POST /approvals/{id}/approve`, `POST /approvals/{id}/deny` with scope enforcement and resource ownership
+- **CLI operator interface**: `bolt approval list`, `bolt approval show`, `bolt approval approve`, `bolt approval deny` for remote decision-making without long-running CLI session
+- **Auto-provisioning**: `DurableApprovalProvider` is created automatically at application startup if no approval provider is configured
+
+The durable provider is suitable for distributed systems where operators and agents run independently. Approval decisions are persisted and audited; tasks waiting for approval set phase to `awaiting_approval` and do not proceed with planning until approved or denied.
+
 ## Agent brain milestone
 
 The project now includes a project-owned agent-brain planner layer that:
