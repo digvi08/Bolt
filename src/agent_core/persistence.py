@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import Any, ClassVar, Concatenate, ParamSpec, Protocol, TypeVar
 from uuid import UUID, uuid4
 
-from .models import AuditEvent, Task, TaskStatus
+from .credential_broker import (
+    AbilityId,
+    CredentialId,
+    CredentialRecord,
+    CredentialScope,
+    CredentialType,
+    ProviderId,
+)
+from .models import LOCAL_CREDENTIAL_CALLER, AuditEvent, CredentialCallerId, Task, TaskStatus
 from .secrets import sanitize_value
 
 
@@ -89,6 +97,33 @@ class OccurrenceStatus(StrEnum):
     UNCERTAIN = "uncertain"
 
 
+class ApprovalStatus(StrEnum):
+    PENDING = "pending"
+    APPROVED = "approved"
+    DENIED = "denied"
+    EXPIRED = "expired"
+    CONSUMED = "consumed"
+    INVALIDATED = "invalidated"
+
+
+@dataclass
+class ApprovalRecord:
+    approval_id: str
+    task_id: UUID
+    action_id: str
+    ability: str
+    action_kind: str
+    provider: str
+    caller_id: str
+    summary: str
+    action_fingerprint: str
+    created_at: datetime
+    expires_at: datetime
+    status: ApprovalStatus = ApprovalStatus.PENDING
+    decision_at: datetime | None = None
+    decision_actor: str | None = None
+
+
 @dataclass
 class ScheduleRecord:
     schedule_id: str
@@ -141,6 +176,7 @@ class IdempotencyConflict(ValueError):
 @dataclass
 class TaskRecord:
     task_id: UUID
+    caller_id: CredentialCallerId = LOCAL_CREDENTIAL_CALLER
     root_task_id: UUID | None = None
     parent_task_id: UUID | None = None
     objective: str = ""
@@ -166,6 +202,7 @@ class TaskRecord:
         metadata.update(extra)
         return cls(
             task_id=task.id,
+            caller_id=task.caller_id,
             root_task_id=getattr(task, "root_task_id", None),
             parent_task_id=getattr(task, "parent_task_id", None),
             objective=getattr(task, "objective", "") or task.instruction.text,
@@ -296,6 +333,20 @@ class TaskStateStore(Protocol):
 
     def record_audit_event(self, event: AuditEvent) -> None: ...
 
+    def create_approval(self, approval: ApprovalRecord) -> ApprovalRecord: ...
+
+    def get_approval(self, approval_id: str) -> ApprovalRecord | None: ...
+
+    def find_approval(self, task_id: UUID | str, fingerprint: str) -> ApprovalRecord | None: ...
+
+    def list_approvals(self, *, limit: int = 100) -> list[ApprovalRecord]: ...
+
+    def decide_approval(
+        self, approval_id: str, *, approve: bool, actor: str, now: datetime
+    ) -> ApprovalRecord | None: ...
+
+    def claim_approval(self, approval_id: str, *, now: datetime) -> ApprovalRecord | None: ...
+
     def save_schedule(self, schedule: ScheduleRecord) -> ScheduleRecord: ...
 
     def load_schedule(self, schedule_id: str) -> ScheduleRecord | None: ...
@@ -354,8 +405,8 @@ class TaskStateMachine:
         TaskStatus.PLANNED: {TaskStatus.AWAITING_APPROVAL, TaskStatus.EXECUTING, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.STOPPED, TaskStatus.SUCCEEDED, TaskStatus.ABORTED},
         TaskStatus.PLANNING: {TaskStatus.PLANNED, TaskStatus.DENIED, TaskStatus.ABORTED},
         TaskStatus.RUNNING: {TaskStatus.EXECUTING, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.SUCCEEDED, TaskStatus.ABORTED},
-        TaskStatus.WAITING_APPROVAL: {TaskStatus.AWAITING_APPROVAL, TaskStatus.DENIED, TaskStatus.ABORTED},
-        TaskStatus.AWAITING_APPROVAL: {TaskStatus.EXECUTING, TaskStatus.DENIED, TaskStatus.ABORTED},
+        TaskStatus.WAITING_APPROVAL: {TaskStatus.AWAITING_APPROVAL, TaskStatus.DENIED, TaskStatus.STOPPED, TaskStatus.ABORTED},
+        TaskStatus.AWAITING_APPROVAL: {TaskStatus.EXECUTING, TaskStatus.DENIED, TaskStatus.STOPPED, TaskStatus.ABORTED},
         TaskStatus.EXECUTING: {TaskStatus.VERIFYING, TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.STOPPED},
         TaskStatus.VERIFYING: {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.STOPPED},
         TaskStatus.RECOVERING: {TaskStatus.AWAITING_APPROVAL, TaskStatus.EXECUTING, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.STOPPED, TaskStatus.SUCCEEDED},
@@ -547,6 +598,7 @@ class SQLiteTaskStore:
             """
             CREATE TABLE IF NOT EXISTS task_records (
                 task_id TEXT PRIMARY KEY,
+                caller_id TEXT NOT NULL DEFAULT 'local',
                 root_task_id TEXT,
                 parent_task_id TEXT,
                 objective TEXT,
@@ -568,6 +620,7 @@ class SQLiteTaskStore:
             )
             """
         )
+        self._add_column("task_records", "caller_id", "TEXT NOT NULL DEFAULT 'local'")
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS action_records (
@@ -667,6 +720,56 @@ class SQLiteTaskStore:
             )
             """
         )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS credential_records (
+                credential_id TEXT PRIMARY KEY,
+                caller_id TEXT NOT NULL,
+                ability_id TEXT NOT NULL,
+                provider_id TEXT NOT NULL,
+                credential_type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                expires_at TEXT,
+                revoked INTEGER NOT NULL,
+                version INTEGER NOT NULL,
+                metadata TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS safety_controls (
+                control_name TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS approval_records (
+                approval_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                action_id TEXT NOT NULL,
+                ability TEXT NOT NULL,
+                action_kind TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                caller_id TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                action_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                decision_at TEXT,
+                decision_actor TEXT,
+                UNIQUE(task_id, action_fingerprint)
+            )
+            """
+        )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS approval_status_expiry ON approval_records(status, expires_at)"
+        )
         self._add_column("action_records", "verification_status", "TEXT NOT NULL DEFAULT 'pending'")
         self._add_column("action_records", "verification_reason", "TEXT NOT NULL DEFAULT ''")
         self._connection.commit()
@@ -691,6 +794,105 @@ class SQLiteTaskStore:
         )
 
     @_synchronized
+    def save_credential_record(self, record: CredentialRecord, event: AuditEvent) -> None:
+        with self.transaction():
+            previous = self.get_credential_record(record.credential_id)
+            if previous is None:
+                if record.version != 1 or record.revoked:
+                    raise ValueError("new credential metadata has an invalid lifecycle state")
+                self._connection.execute(
+                    """
+                    INSERT INTO credential_records (
+                        credential_id, caller_id, ability_id, provider_id, credential_type,
+                        created_at, updated_at, expires_at, revoked, version, metadata
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    self._credential_values(record),
+                )
+            else:
+                if (
+                    record.scope != previous.scope
+                    or record.credential_type is not previous.credential_type
+                    or previous.revoked and not record.revoked
+                    or record.version != previous.version + 1
+                ):
+                    raise ValueError("credential metadata lifecycle transition is invalid")
+                self._connection.execute(
+                    """
+                    UPDATE credential_records SET
+                        updated_at=?, expires_at=?, revoked=?, version=?, metadata=?
+                    WHERE credential_id=?
+                    """,
+                    (
+                        record.updated_at.isoformat(),
+                        record.expires_at.isoformat() if record.expires_at else None,
+                        int(record.revoked),
+                        record.version,
+                        json.dumps(sanitize_value(record.metadata)),
+                        str(record.credential_id),
+                    ),
+                )
+            self._queue_audit(event)
+
+    @staticmethod
+    def _credential_values(record: CredentialRecord) -> tuple[object, ...]:
+        return (
+            str(record.credential_id),
+            str(record.scope.caller_id),
+            str(record.scope.ability_id),
+            str(record.scope.provider_id),
+            record.credential_type.value,
+            record.created_at.isoformat(),
+            record.updated_at.isoformat(),
+            record.expires_at.isoformat() if record.expires_at else None,
+            int(record.revoked),
+            record.version,
+            json.dumps(sanitize_value(record.metadata)),
+        )
+
+    @_synchronized
+    def get_credential_record(self, credential_id: CredentialId) -> CredentialRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM credential_records WHERE credential_id=?",
+            (str(credential_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return CredentialRecord(
+                credential_id=CredentialId(row["credential_id"]),
+                scope=CredentialScope(
+                    caller_id=CredentialCallerId(row["caller_id"]),
+                    ability_id=AbilityId(row["ability_id"]),
+                    provider_id=ProviderId(row["provider_id"]),
+                ),
+                credential_type=CredentialType(row["credential_type"]),
+                created_at=datetime.fromisoformat(row["created_at"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+                expires_at=datetime.fromisoformat(row["expires_at"]) if row["expires_at"] else None,
+                revoked=bool(row["revoked"]),
+                version=int(row["version"]),
+                metadata=json.loads(row["metadata"] or "{}"),
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("credential metadata record is corrupt") from None
+
+    @_synchronized
+    def list_credential_records(
+        self, *, caller_id: CredentialCallerId
+    ) -> tuple[CredentialRecord, ...]:
+        rows = self._connection.execute(
+            "SELECT credential_id FROM credential_records WHERE caller_id=? ORDER BY credential_id",
+            (str(caller_id),),
+        ).fetchall()
+        records = tuple(
+            record
+            for row in rows
+            if (record := self.get_credential_record(CredentialId(row["credential_id"]))) is not None
+        )
+        return records
+
+    @_synchronized
     def audit_events(self, task_id: UUID | str | None = None) -> list[AuditEvent]:
         if task_id is None:
             rows = self._connection.execute(
@@ -710,6 +912,27 @@ class SQLiteTaskStore:
             )
             for row in rows
         ]
+
+    @_synchronized
+    def kill_switch_active(self) -> bool:
+        row = self._connection.execute(
+            "SELECT enabled FROM safety_controls WHERE control_name = 'kill_switch'"
+        ).fetchone()
+        return bool(row["enabled"]) if row is not None else False
+
+    @_synchronized
+    def set_kill_switch_active(self, active: bool) -> None:
+        with self.transaction():
+            self._connection.execute(
+                """
+                INSERT INTO safety_controls (control_name, enabled, updated_at)
+                VALUES ('kill_switch', ?, ?)
+                ON CONFLICT(control_name) DO UPDATE SET
+                    enabled=excluded.enabled,
+                    updated_at=excluded.updated_at
+                """,
+                (int(active), _utc_now().isoformat()),
+            )
 
     def _add_column(self, table: str, name: str, definition: str) -> None:
         columns = {
@@ -770,12 +993,13 @@ class SQLiteTaskStore:
         self._connection.execute(
             """
             INSERT INTO task_records (
-                task_id, root_task_id, parent_task_id, objective, status, current_phase,
+                task_id, caller_id, root_task_id, parent_task_id, objective, status, current_phase,
                 current_plan_version, current_step, completed_steps, failed_steps, retry_count,
                 replan_count, approval_state, verification_state, last_error, termination_reason,
                 created_at, updated_at, execution_metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id) DO UPDATE SET
+                caller_id=excluded.caller_id,
                 root_task_id=excluded.root_task_id,
                 parent_task_id=excluded.parent_task_id,
                 objective=excluded.objective,
@@ -797,6 +1021,7 @@ class SQLiteTaskStore:
             """,
             (
                 str(record.task_id),
+                str(record.caller_id),
                 str(record.root_task_id) if record.root_task_id is not None else None,
                 str(record.parent_task_id) if record.parent_task_id is not None else None,
                 sanitize_value(record.objective),
@@ -862,6 +1087,7 @@ class SQLiteTaskStore:
             return None
         return TaskRecord(
             task_id=UUID(row["task_id"]),
+            caller_id=CredentialCallerId(row["caller_id"]),
             root_task_id=UUID(row["root_task_id"]) if row["root_task_id"] else None,
             parent_task_id=UUID(row["parent_task_id"]) if row["parent_task_id"] else None,
             objective=row["objective"] or "",
@@ -1777,6 +2003,178 @@ class SQLiteTaskStore:
             if not include_expired:
                 self.record_audit_event(AuditEvent("memory.expired_records_excluded", UUID(str(task_id))))
         return records
+
+    @_synchronized
+    def create_approval(self, approval: ApprovalRecord) -> ApprovalRecord:
+        if approval.expires_at <= approval.created_at:
+            raise ValueError("approval expiry must follow its creation time")
+        task = self.load_task(approval.task_id)
+        if task is None or str(task.caller_id) != approval.caller_id:
+            raise ValueError("approval task identity is unavailable")
+        existing = self.find_approval(approval.task_id, approval.action_fingerprint)
+        if existing is not None:
+            return existing
+        with self.transaction():
+            self._connection.execute(
+                """
+                INSERT INTO approval_records (
+                    approval_id, task_id, action_id, ability, action_kind, provider,
+                    caller_id, summary, action_fingerprint, created_at, expires_at,
+                    status, decision_at, decision_actor
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+                """,
+                (
+                    approval.approval_id,
+                    str(approval.task_id),
+                    sanitize_value(approval.action_id),
+                    sanitize_value(approval.ability),
+                    sanitize_value(approval.action_kind),
+                    sanitize_value(approval.provider),
+                    sanitize_value(approval.caller_id),
+                    sanitize_value(approval.summary),
+                    approval.action_fingerprint,
+                    approval.created_at.isoformat(),
+                    approval.expires_at.isoformat(),
+                    ApprovalStatus.PENDING.value,
+                ),
+            )
+        return approval
+
+    @_synchronized
+    def get_approval(self, approval_id: str) -> ApprovalRecord | None:
+        row = self._connection.execute(
+            "SELECT * FROM approval_records WHERE approval_id=?",
+            (approval_id,),
+        ).fetchone()
+        return self._approval_record(row) if row is not None else None
+
+    @_synchronized
+    def find_approval(self, task_id: UUID | str, fingerprint: str) -> ApprovalRecord | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM approval_records
+            WHERE task_id=? AND action_fingerprint=?
+            """,
+            (str(task_id), fingerprint),
+        ).fetchone()
+        return self._approval_record(row) if row is not None else None
+
+    @_synchronized
+    def list_approvals(self, *, limit: int = 100) -> list[ApprovalRecord]:
+        if limit < 1 or limit > 1000:
+            raise ValueError("approval limit must be between 1 and 1000")
+        rows = self._connection.execute(
+            """
+            SELECT * FROM approval_records
+            ORDER BY CASE status WHEN 'pending' THEN 0 ELSE 1 END, created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [self._approval_record(row) for row in rows]
+
+    @_synchronized
+    def decide_approval(
+        self, approval_id: str, *, approve: bool, actor: str, now: datetime
+    ) -> ApprovalRecord | None:
+        actor = sanitize_value(actor)
+        with self.transaction():
+            row = self._connection.execute(
+                "SELECT * FROM approval_records WHERE approval_id=?",
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            approval = self._approval_record(row)
+            if approval.status is ApprovalStatus.PENDING and approval.expires_at <= now:
+                self._connection.execute(
+                    """
+                    UPDATE approval_records SET status=?, decision_at=?, decision_actor=?
+                    WHERE approval_id=? AND status=?
+                    """,
+                    (
+                        ApprovalStatus.EXPIRED.value,
+                        now.isoformat(),
+                        actor,
+                        approval_id,
+                        ApprovalStatus.PENDING.value,
+                    ),
+                )
+                return self.get_approval(approval_id)
+            if approval.status is not ApprovalStatus.PENDING:
+                return approval
+            self._connection.execute(
+                """
+                UPDATE approval_records SET status=?, decision_at=?, decision_actor=?
+                WHERE approval_id=? AND status=?
+                """,
+                (
+                    ApprovalStatus.APPROVED.value if approve else ApprovalStatus.DENIED.value,
+                    now.isoformat(),
+                    actor,
+                    approval_id,
+                    ApprovalStatus.PENDING.value,
+                ),
+            )
+        return self.get_approval(approval_id)
+
+    @_synchronized
+    def claim_approval(self, approval_id: str, *, now: datetime) -> ApprovalRecord | None:
+        with self.transaction():
+            row = self._connection.execute(
+                "SELECT * FROM approval_records WHERE approval_id=?",
+                (approval_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            approval = self._approval_record(row)
+            if approval.status is not ApprovalStatus.APPROVED:
+                return approval
+            if approval.expires_at <= now:
+                self._connection.execute(
+                    "UPDATE approval_records SET status=? WHERE approval_id=? AND status=?",
+                    (
+                        ApprovalStatus.EXPIRED.value,
+                        approval_id,
+                        ApprovalStatus.APPROVED.value,
+                    ),
+                )
+                return self.get_approval(approval_id)
+            changed = self._connection.execute(
+                "UPDATE approval_records SET status=? WHERE approval_id=? AND status=?",
+                (
+                    ApprovalStatus.CONSUMED.value,
+                    approval_id,
+                    ApprovalStatus.APPROVED.value,
+                ),
+            ).rowcount
+            if changed != 1:
+                return None
+        return self.get_approval(approval_id)
+
+    @staticmethod
+    def _approval_record(row: sqlite3.Row) -> ApprovalRecord:
+        try:
+            return ApprovalRecord(
+                approval_id=row["approval_id"],
+                task_id=UUID(row["task_id"]),
+                action_id=row["action_id"],
+                ability=row["ability"],
+                action_kind=row["action_kind"],
+                provider=row["provider"],
+                caller_id=row["caller_id"],
+                summary=row["summary"],
+                action_fingerprint=row["action_fingerprint"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                expires_at=datetime.fromisoformat(row["expires_at"]),
+                status=ApprovalStatus(row["status"]),
+                decision_at=datetime.fromisoformat(row["decision_at"])
+                if row["decision_at"]
+                else None,
+                decision_actor=row["decision_actor"],
+            )
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("approval record is corrupt") from None
 
     @_synchronized
     def delete_expired_memories(self) -> int:

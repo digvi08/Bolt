@@ -17,6 +17,7 @@ class AgentConfig:
     audit_required: bool = True
     max_plan_steps: int = 8
     max_replans: int = 2
+    max_tool_calls: int = 8
     max_model_calls: int = 3
     max_total_tokens: int = 4096
     max_total_cost: float | None = None
@@ -40,6 +41,7 @@ def load_config(values: Mapping[str, str] | None = None) -> AgentConfig:
         audit_required=values.get("audit_required", "true").lower() == "true",
         max_plan_steps=int(values.get("max_plan_steps", "8")),
         max_replans=int(values.get("max_replans", "2")),
+        max_tool_calls=int(values.get("max_tool_calls", "8")),
         max_model_calls=int(values.get("max_model_calls", "3")),
         max_total_tokens=int(values.get("max_total_tokens", "4096")),
         max_total_cost=float(values["max_total_cost"]) if "max_total_cost" in values else None,

@@ -11,6 +11,7 @@ from enum import Enum
 from uuid import UUID, uuid4
 
 from agent_core.models import ActionKind, ActionRequest, RiskLevel, UntrustedContent
+from agent_core.secrets import Secret, sanitize_text
 
 
 class TrustBoundary(str, Enum):
@@ -56,9 +57,10 @@ class BrowserErrorKind(str, Enum):
 
 class BrowserError(RuntimeError):
     def __init__(self, kind: BrowserErrorKind, message: str = "browser operation failed") -> None:
-        super().__init__(message)
+        safe_message = sanitize_text(message)
+        super().__init__(safe_message)
         self.kind = kind
-        self.safe_message = message
+        self.safe_message = safe_message
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,10 @@ class BrowserTab:
     url: str
     title: str = ""
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "url", sanitize_text(self.url))
+        object.__setattr__(self, "title", sanitize_text(self.title))
+
 
 @dataclass(frozen=True)
 class BrowserElement:
@@ -85,6 +91,13 @@ class BrowserElement:
     tag_name: str
     attributes: Mapping[str, str] = field(default_factory=dict)
     trust_boundary: TrustBoundary = TrustBoundary.UNTRUSTED_WEB
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "attributes",
+            {str(key): sanitize_text(str(value)) for key, value in self.attributes.items()},
+        )
 
 
 @dataclass(frozen=True)
@@ -114,9 +127,12 @@ class BrowserObservation:
 class Screenshot:
     tab_id: UUID
     mime_type: str
-    data: bytes = field(repr=False)
+    data: Secret[bytes] = field(repr=False)
     url: str
     trust_boundary: TrustBoundary = TrustBoundary.UNTRUSTED_WEB
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "url", sanitize_text(self.url))
 
 
 @dataclass(frozen=True)
@@ -274,6 +290,12 @@ class BrowserDownload:
     size: int | None = None
     trust_boundary: TrustBoundary = TrustBoundary.UNTRUSTED_WEB
 
+    def __post_init__(self) -> None:
+        for name in ("filename", "suggested_filename", "source_url", "destination"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, sanitize_text(value))
+
 
 @dataclass(frozen=True)
 class BrowserPopup:
@@ -398,11 +420,16 @@ class BrowserAction:
 
 
 def external_text(text: str, source: str = "browser") -> UntrustedContent:
-    return UntrustedContent(text=text, source=f"{TrustBoundary.UNTRUSTED_WEB.value}:{source}")
+    return UntrustedContent(
+        text=sanitize_text(text),
+        source=f"{TrustBoundary.UNTRUSTED_WEB.value}:{sanitize_text(source)}",
+    )
 
 
 def redact_sensitive(value: str | None, sensitive: bool) -> str | None:
-    return "[REDACTED]" if sensitive and value is not None else value
+    if value is None:
+        return None
+    return "[REDACTED]" if sensitive else sanitize_text(value)
 
 
 __all__ = [

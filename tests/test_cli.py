@@ -5,8 +5,15 @@ from io import StringIO
 from uuid import UUID, uuid4
 
 from agent_core.application import AgentApplication, ApplicationState
-from agent_core.cli import _build_parser, run_cli
-from agent_core.models import ActionKind, TaskStatus
+from agent_core.cli import _build_parser, _ConsoleApprovalProvider, run_cli
+from agent_core.models import (
+    ActionKind,
+    ActionRequest,
+    ApprovalRequest,
+    PolicyDecision,
+    RiskLevel,
+    TaskStatus,
+)
 from agent_core.persistence import ScheduleType
 from agent_core.runtime import ActionReconciliationOutcome
 from agent_core.service import (
@@ -367,3 +374,76 @@ def test_default_cli_uses_application_owner_and_releases_it(tmp_path):
     application = AgentApplication(database)
     assert application.start().state is ApplicationState.READY
     asyncio.run(application.shutdown())
+
+
+def test_doctor_reports_current_allowlist_workspace_and_kill_switch(tmp_path, monkeypatch):
+    monkeypatch.setenv("BOLT_ALLOWED_ACTIONS", "network_read,read_only")
+    monkeypatch.setenv("BOLT_ENABLE_EXTERNAL_INTEGRATIONS", "true")
+    monkeypatch.setenv("BOLT_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("BOLT_KILL_SWITCH_ACTIVE", "true")
+    stdout = StringIO()
+    stderr = StringIO()
+
+    code = run_cli(
+        ["--database", str(tmp_path / "doctor.sqlite3"), "doctor", "--json"],
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    result = json.loads(stdout.getvalue())
+    assert code == 0
+    assert stderr.getvalue() == ""
+    assert result["application_state"] == "ready"
+    assert result["registered_abilities"] == ["web", "workspace"]
+    assert result["browser"]["status"] == "unsupported_not_registered"
+    assert result["web_search"]["available"] is True
+    assert result["web_fetch"]["available"] is True
+    assert result["workspace"]["configured"] is True
+    assert result["scheduler"]["available"] is True
+    assert result["kill_switch_available"] is True
+    assert result["kill_switch_active"] is True
+    assert result["approval_provider_available"] is True  # DurableApprovalProvider auto-created
+    assert result["model_provider_configured"] is False
+
+
+def test_console_approval_requires_explicit_yes_and_redacts_sensitive_parameters():
+    task_id = uuid4()
+    request = ApprovalRequest(
+        task_id=task_id,
+        action=ActionRequest(
+            task_id=task_id,
+            name="workspace.write_text",
+            kind=ActionKind.WRITE_FILE,
+            parameters={"path": "notes.txt", "api_key": "do-not-display"},
+        ),
+        decision=PolicyDecision(True, RiskLevel.MEDIUM, "approval required", True),
+    )
+    output = StringIO()
+    provider = _ConsoleApprovalProvider(lambda _prompt: "yes", output)
+
+    assert provider.approve(request) is False
+    assert "do-not-display" not in output.getvalue()
+    assert "Approval required" in output.getvalue()
+
+    provider = _ConsoleApprovalProvider(lambda _prompt: "y", StringIO())
+    assert provider.approve(request) is True
+
+
+def test_cli_kill_switch_commands_persist_across_owned_application_runs(tmp_path):
+    database = str(tmp_path / "operator.sqlite3")
+
+    engage_out = StringIO()
+    assert run_cli(
+        ["--database", database, "safety", "kill-switch", "engage", "--json"],
+        stdout=engage_out,
+        stderr=StringIO(),
+    ) == 0
+    assert json.loads(engage_out.getvalue()) == {"active": True}
+
+    status_out = StringIO()
+    assert run_cli(
+        ["--database", database, "safety", "kill-switch", "status", "--json"],
+        stdout=status_out,
+        stderr=StringIO(),
+    ) == 0
+    assert json.loads(status_out.getvalue()) == {"active": True}

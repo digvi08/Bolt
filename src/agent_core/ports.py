@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
 
@@ -37,18 +36,6 @@ class VerificationProvider(Protocol):
 
 class RecoveryProvider(Protocol):
     def recover(self, task_id: UUID, error: Exception) -> RecoveryResult: ...
-
-
-@dataclass(frozen=True)
-class CredentialHandle:
-    """Opaque reference; the secret value is intentionally absent from this type."""
-
-    id: str
-    scope: str
-
-
-class CredentialBroker(Protocol):
-    def issue_handle(self, scope: str) -> CredentialHandle | None: ...
 
 
 class KillSwitch(Protocol):

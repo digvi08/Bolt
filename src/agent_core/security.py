@@ -7,6 +7,7 @@ from .models import ActionKind, ActionRequest, PolicyDecision, RiskLevel
 
 _RISK_BY_KIND = {
     ActionKind.READ_ONLY: RiskLevel.LOW,
+    ActionKind.NETWORK_READ: RiskLevel.LOW,
     ActionKind.WRITE_FILE: RiskLevel.MEDIUM,
     ActionKind.PROCESS: RiskLevel.HIGH,
     ActionKind.NETWORK: RiskLevel.HIGH,
@@ -35,6 +36,11 @@ class DefaultPolicyEngine:
             return PolicyDecision(False, risk, "unknown and high-risk actions are denied")
         if kind not in self._config.allowed_actions:
             return PolicyDecision(False, risk, "action kind is not explicitly allowlisted")
+        if (
+            kind in {ActionKind.NETWORK_READ, ActionKind.NETWORK}
+            and not self._config.enable_external_integrations
+        ):
+            return PolicyDecision(False, risk, "external integrations are disabled")
         if risk is RiskLevel.HIGH and kind is not ActionKind.BROWSER:
             return PolicyDecision(False, risk, "high-risk non-browser actions are denied")
         requires_approval = _RISK_ORDER[risk] >= _RISK_ORDER[self._config.approval_required_at]

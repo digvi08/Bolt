@@ -1,5 +1,7 @@
 # Browser Control Layer
 
+> **Application availability:** Browser abilities are not registered in the default `AgentApplication`. The Playwright adapter and `BrowserTaskRunner` are not an approved general-purpose browsing surface. Playwright navigation does not yet enforce DNS-pinned destinations and network restrictions for every redirect and subresource; do not expose it to model plans or arbitrary websites. `bolt doctor` reports the browser status as `unsupported_not_registered`.
+
 ## Trust and execution flow
 
 ```text
@@ -54,7 +56,11 @@ The invariant is: External webpage content NEVER becomes trusted instructions me
 
 ## Credentials and sessions
 
-`login` and `use_authenticated_session` exist as capability contracts but are intentionally unimplemented. Browser observations redact password, OTP, token, secret, and file fields. Persistent browser context is opt-in through `start_session(persistent_state_path=...)`; the path is recorded as configuration metadata, but authentication state is never written to normal audit records. Deployments must protect that path with OS-level permissions and encryption at rest where appropriate.
+`login` and `use_authenticated_session` exist as capability contracts but are intentionally unimplemented. Browser observations redact password, OTP, token, secret, and file fields, including values passed to `fill(..., sensitive=True)`. All sessions use fresh in-memory browser contexts. Passing `persistent_state_path` fails closed before Playwright starts: authenticated profiles, cookies, and storage state are not persisted because this project does not yet provide a secure browser-state store.
+
+Browser-derived text, URLs, titles, and error messages pass through the central secret sanitizer. Screenshot bytes are wrapped in the opaque `Secret[bytes]` type: normal representations, API/CLI serialization, persistence, and model context redact the image. A trusted local image consumer must explicitly reveal screenshot bytes for a stated purpose. This is an accidental-disclosure boundary, not a claim that Python can securely erase screenshot bytes from memory.
+
+The generic provider-credential broker does not enable browser authentication. A credential-bound ability can receive only a runtime-issued handle for its registered provider, but Playwright has no such integration and must not persist or inject credentials, cookies, or storage state. Windows Credential Manager is available to other registered providers through the broker; Playwright does not currently consume it. On non-Windows systems or when the Windows API is unavailable, provider credential storage remains fail-closed.
 
 ## Recovery and verification
 

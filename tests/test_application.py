@@ -27,6 +27,7 @@ from agent_core.persistence import (
     SQLiteTaskStore,
     TaskRecord,
 )
+from agent_core.secrets import Secret
 
 
 def _own_database_until_released(
@@ -46,8 +47,9 @@ def _own_database_until_released(
         asyncio.run(application.shutdown())
 
 
-def _auth(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
+def _auth(token: str | Secret[str]) -> dict[str, str]:
+    value = token.reveal(purpose="test HTTP authentication") if isinstance(token, Secret) else token
+    return {"Authorization": f"Bearer {value}"}
 
 
 def test_application_state_machine_and_idempotent_shutdown(tmp_path):
@@ -86,10 +88,37 @@ def test_single_application_owns_one_scheduler_and_api_uses_same_service(tmp_pat
         assert payload["state"] == "ready"
         assert payload["ownership_held"] is True
         assert payload["persistence_available"] is True
-        assert payload["kill_switch_available"] is False
-        assert "credential" not in response.text.lower()
+        assert payload["kill_switch_available"] is True
+        assert isinstance(payload["provider_store_available"], bool)
+        assert "secret_ref:" not in response.text
 
     assert application.state is ApplicationState.STOPPED
+
+
+def test_operator_kill_switch_persists_and_environment_override_cannot_be_cleared(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    database = tmp_path / "safety.sqlite3"
+    application = AgentApplication(database)
+    application.start()
+
+    assert application.set_kill_switch_active(True) is True
+    assert application._runtime is not None
+    assert application._runtime.kill_switch_active() is True
+    events = application.store.audit_events()
+    assert any(event.event_type == "safety.kill_switch_activated" for event in events)
+    asyncio.run(application.shutdown())
+
+    restarted = AgentApplication(database)
+    restarted.start()
+    assert restarted._runtime is not None
+    assert restarted._runtime.kill_switch_active() is True
+    assert restarted.set_kill_switch_active(False) is False
+
+    monkeypatch.setenv("BOLT_KILL_SWITCH_ACTIVE", "true")
+    assert restarted.set_kill_switch_active(False) is True
+    assert restarted._runtime.kill_switch_active() is True
+    asyncio.run(restarted.shutdown())
 
 
 def test_scheduler_start_requires_ready_owner_and_shutdown_stops_it(tmp_path):
@@ -406,6 +435,8 @@ def test_startup_failure_releases_resources_and_ownership(
         with pytest.raises(AgentApplicationError) as error:
             application.start(api_credentials=credentials if failure_point == "api" else None)
         assert error.value.code is ApplicationErrorCode.STARTUP_FAILED
+        assert error.value.__context__ is None
+        assert error.value.__cause__ is None
 
     assert application.state is ApplicationState.FAILED
     assert not application._ownership.held

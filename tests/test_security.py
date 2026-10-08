@@ -28,6 +28,24 @@ def test_medium_risk_requires_approval_when_allowlisted():
     assert decision.risk is RiskLevel.MEDIUM
 
 
+def test_network_read_requires_allowlisting_and_external_integrations_opt_in():
+    action = request(ActionKind.NETWORK_READ)
+    denied = DefaultPolicyEngine(
+        AgentConfig(allowed_actions=frozenset({ActionKind.NETWORK_READ}))
+    ).evaluate(action)
+    assert not denied.allowed
+    assert "external integrations" in denied.reason
+
+    allowed = DefaultPolicyEngine(
+        AgentConfig(
+            allowed_actions=frozenset({ActionKind.NETWORK_READ}),
+            enable_external_integrations=True,
+        )
+    ).evaluate(action)
+    assert allowed.allowed
+    assert allowed.risk is RiskLevel.LOW
+
+
 def test_config_parsing_preserves_safe_defaults():
     config = load_config({"allowed_actions": "read_only", "enable_external_integrations": "true"})
     assert config.allowed_actions == frozenset({ActionKind.READ_ONLY})

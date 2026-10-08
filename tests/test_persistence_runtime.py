@@ -580,6 +580,44 @@ def test_kill_switch_blocks_restart_reconciliation_and_execution(tmp_path, monke
     assert reconciler.calls == 0
     assert retry_provider.calls == 0
     assert any(event.event_type == "reconciliation.blocked_by_kill_switch" for event in audit.events)
+
+
+def test_kill_switch_is_rechecked_after_interactive_approval(tmp_path):
+    store = SQLiteTaskStore(tmp_path / "approval-switch.sqlite3")
+    actions = Actions()
+    switch = Switch()
+    audit = Audit()
+    task = make_task()
+    request = make_action(task, kind=ActionKind.WRITE_FILE)
+
+    class EngageDuringApproval:
+        def approve(self, _request):
+            switch.engaged = True
+            return True
+
+    runtime = make_runtime(
+        store,
+        actions,
+        audit=audit,
+        switch=switch,
+        config=AgentConfig(
+            allowed_actions=frozenset({ActionKind.WRITE_FILE}),
+            approval_required_at=RiskLevel.MEDIUM,
+        ),
+        approval=EngageDuringApproval(),
+    )
+
+    result = runtime.run(task, request)
+
+    assert not result.success
+    assert result.failure_type == "kill_switch"
+    assert actions.calls == 0
+    assert task.status is TaskStatus.STOPPED
+    assert any(event.event_type == "action.blocked_by_kill_switch" for event in audit.events)
+    assert any(
+        event.event_type == "action.blocked_by_kill_switch"
+        for event in store.audit_events(task.id)
+    )
     store.close()
 
 

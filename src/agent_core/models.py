@@ -5,8 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, NewType
 from uuid import UUID, uuid4
+
+CredentialId = NewType("CredentialId", str)
+ProviderId = NewType("ProviderId", str)
+AbilityId = NewType("AbilityId", str)
+CredentialCallerId = NewType("CredentialCallerId", str)
+LOCAL_CREDENTIAL_CALLER = CredentialCallerId("local")
 
 
 def utc_now() -> datetime:
@@ -49,6 +55,7 @@ class ActionKind(str, Enum):
     WRITE_FILE = "write_file"
     PROCESS = "process"
     NETWORK = "network"
+    NETWORK_READ = "network_read"
     BROWSER = "browser"
     DESKTOP = "desktop"
     ADMINISTRATOR = "administrator"
@@ -71,6 +78,7 @@ class UntrustedContent:
 class Task:
     instruction: TrustedInstruction
     external_context: tuple[UntrustedContent, ...] = ()
+    caller_id: CredentialCallerId = LOCAL_CREDENTIAL_CALLER
     id: UUID = field(default_factory=uuid4)
     root_task_id: UUID | None = None
     parent_task_id: UUID | None = None
@@ -100,6 +108,8 @@ class ActionRequest:
     parameters: dict[str, Any] = field(default_factory=dict)
     requested_risk: RiskLevel | None = None
     execution_id: str | None = None
+    ability_id: AbilityId | None = None
+    provider_id: ProviderId | None = None
 
 
 @dataclass(frozen=True)

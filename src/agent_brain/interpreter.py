@@ -25,6 +25,7 @@ class DeterministicTaskInterpreter(TaskInterpreter):
         risk = "read"
         contains_consequential_action = False
         possible_consequential_actions: list[str] = []
+        constraints: list[str] = []
 
         if any(token in lower for token in ("submit", "confirm", "send", "purchase", "book", "pay", "place order")):
             goal = TaskGoal.SUBMIT_FORM
@@ -38,6 +39,24 @@ class DeterministicTaskInterpreter(TaskInterpreter):
             risk = "medium"
             contains_consequential_action = True
             possible_consequential_actions.append("fill")
+        elif "https://" in lower or "http://" in lower or any(
+            token in lower
+            for token in ("search the web", "web search", "search online", "research online")
+        ):
+            goal = TaskGoal.FIND_INFORMATION
+            ability = "web"
+            risk = "read"
+        elif any(token in lower for token in ("list files", "list directory", "read file", "workspace file")):
+            goal = TaskGoal.GENERIC_ACTION
+            ability = "workspace"
+            risk = "read"
+        elif any(token in lower for token in ("create file ", "write file ", "save file ")):
+            goal = TaskGoal.GENERIC_ACTION
+            ability = "workspace"
+            risk = "medium"
+            contains_consequential_action = True
+            possible_consequential_actions.append("create file")
+            constraints.append("workspace write requires current approval")
         elif any(token in lower for token in ("find", "search", "lookup", "look up", "inspect", "observe", "open")):
             goal = TaskGoal.FIND_INFORMATION
             ability = "browser"
@@ -51,7 +70,6 @@ class DeterministicTaskInterpreter(TaskInterpreter):
             ability = "browser"
 
         entities = tuple(sorted({match.strip("'\" ") for match in re.findall(r'"([^"]+)"|\b[a-zA-Z0-9_.-]+\b', text) if match.strip()}))
-        constraints: list[str] = []
         if contains_consequential_action:
             constraints.append("approval required for consequential action")
         if "today" in lower or "now" in lower:

@@ -7,14 +7,20 @@ import json
 from dataclasses import dataclass, field
 
 from agent_core.config import AgentConfig
+from agent_core.credential_broker import CredentialBroker, CredentialHandle
 from agent_core.models import (
+    AbilityId,
     ActionKind,
     ActionRequest,
+    CredentialId,
+    ProviderId,
+    RiskLevel,
     Task,
 )
 from agent_core.persistence import TaskStateStore
 from agent_core.ports import ApprovalProvider, AuditSink, KillSwitch, VerificationProvider
 from agent_core.runtime import ActionReconciler, AgentRuntime
+from agent_core.secrets import sanitize_text, sanitize_value
 
 from .models import AbilityAction, AbilityContext, AbilityDescriptor, AbilityProvider, AbilityResult
 
@@ -58,6 +64,7 @@ class AbilityRouter:
     verifier: VerificationProvider | None = None
     state_store: TaskStateStore | None = None
     action_reconciler: ActionReconciler | None = None
+    credential_broker: CredentialBroker | None = None
 
     def route(
         self,
@@ -71,24 +78,34 @@ class AbilityRouter:
             return AbilityResult(False, reason=f"unknown ability: {action.ability}")
         if not provider.supports(action.action):
             return AbilityResult(False, reason=f"unknown action '{action.action}' for ability '{action.ability}'")
+        requested_risk = action.risk
+        risk_for = getattr(provider, "risk_for", None)
+        if callable(risk_for):
+            requested_risk = risk_for(action.action)
+            if not isinstance(requested_risk, RiskLevel) or requested_risk is RiskLevel.UNKNOWN:
+                return AbilityResult(False, reason="ability action has no trusted risk classification")
 
         request = ActionRequest(
             task_id=task.id,
             name=f"{action.ability}.{action.action}",
-            kind=self._kind_for(action.ability),
+            kind=self._kind_for(action.ability, action.action, provider),
             parameters={
                 "ability": action.ability,
                 "action": action.action,
                 "payload": action.payload,
             },
-            requested_risk=action.risk,
+            requested_risk=requested_risk,
             execution_id=action.execution_id or stable_execution_id(task.id, action),
+            ability_id=AbilityId(action.ability),
+            provider_id=ProviderId(provider.descriptor.provider or action.ability),
         )
 
         runtime = AgentRuntime(
             config=self.config,
             action_provider=_RegisteredAbilityActionProvider(
-                provider, action, context or AbilityContext(task_id=task.id, task=task)
+                provider,
+                action,
+                context or AbilityContext(task_id=task.id, task=task, caller_id=task.caller_id),
             ),
             audit_sink=self.audit_sink or _NoAuditSink(),
             kill_switch=self.kill_switch or _PassthroughKillSwitch(),
@@ -96,6 +113,7 @@ class AbilityRouter:
             verifier=self.verifier,
             state_store=self.state_store,
             action_reconciler=self.action_reconciler,
+            credential_broker=self.credential_broker,
         )
         result = runtime.run(task, request)
         if not result.success:
@@ -107,9 +125,27 @@ class AbilityRouter:
             )
         if isinstance(result.value, AbilityResult):
             return result.value
+        if isinstance(result.value, dict) and isinstance(result.value.get("success"), bool):
+            return AbilityResult(
+                success=result.value["success"],
+                value=result.value.get("value"),
+                reason=sanitize_text(str(result.value.get("reason", ""))),
+                metadata=sanitize_value(result.value.get("metadata", {})),
+                failure_type=(
+                    sanitize_text(result.value["failure_type"])
+                    if isinstance(result.value.get("failure_type"), str)
+                    else None
+                ),
+                retryable=bool(result.value.get("retryable", False)),
+            )
         return AbilityResult(True, value=result.value)
 
-    def _kind_for(self, ability: str) -> ActionKind:
+    def _kind_for(self, ability: str, action: str, provider: AbilityProvider) -> ActionKind:
+        action_kind = getattr(provider, "action_kind", None)
+        if callable(action_kind):
+            kind = action_kind(action)
+            if isinstance(kind, ActionKind):
+                return kind
         if ability == "browser":
             return ActionKind.BROWSER
         if ability == "desktop":
@@ -125,6 +161,23 @@ class _RegisteredAbilityActionProvider:
 
     def execute(self, _request: ActionRequest) -> AbilityResult:
         return self._provider.execute(self._action, self._context)
+
+    def credential_binding(self) -> CredentialId | None:
+        return self._provider.descriptor.credential_id
+
+    def execute_with_credential_handle(
+        self,
+        _request: ActionRequest,
+        handle: CredentialHandle,
+    ) -> AbilityResult:
+        context = AbilityContext(
+            task_id=self._context.task_id,
+            task=self._context.task,
+            caller_id=self._context.caller_id,
+            credential_handle=handle,
+            metadata=self._context.metadata,
+        )
+        return self._provider.execute(self._action, context)
 
 
 class _NoAuditSink:

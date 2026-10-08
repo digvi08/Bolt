@@ -39,6 +39,7 @@ from agent_core.runtime import (
     AgentRuntime,
 )
 from agent_core.scheduler import TaskScheduler
+from agent_core.secrets import Secret
 from agent_core.service import (
     ActionStatusResponse,
     AgentService,
@@ -317,8 +318,9 @@ def build_client(tmp_path, *, scopes: set[ApiScope], service: ServiceStub | None
     return TestClient(app), store, credential, service
 
 
-def auth(token: str) -> dict[str, str]:
-    return {"Authorization": f"Bearer {token}"}
+def auth(token: str | Secret[str]) -> dict[str, str]:
+    value = token.reveal(purpose="test HTTP authentication") if isinstance(token, Secret) else token
+    return {"Authorization": f"Bearer {value}"}
 
 
 def submit_headers(token: str, key: str = "api-test-key") -> dict[str, str]:
@@ -595,19 +597,21 @@ def test_credentials_are_hashed_and_authenticate_rotate_revoke(tmp_path):
     issued = store.create({ApiScope.TASK_READ})
 
     contents = path.read_text(encoding="utf-8")
-    assert issued.token not in contents
-    assert store.authenticate(issued.token) is not None
-    assert store.authenticate(issued.token + "bad") is None
+    issued_token = issued.token.reveal(purpose="credential lifecycle test")
+    assert issued_token not in contents
+    assert store.authenticate(issued_token) is not None
+    assert store.authenticate(issued_token + "bad") is None
 
     rotated = store.rotate(issued.credential_id)
     assert rotated.credential_id == issued.credential_id
-    assert store.authenticate(issued.token) is None
-    assert store.authenticate(rotated.token) is not None
+    assert store.authenticate(issued_token) is None
+    rotated_token = rotated.token.reveal(purpose="credential lifecycle test")
+    assert store.authenticate(rotated_token) is not None
     store.revoke(issued.credential_id)
-    assert store.authenticate(rotated.token) is None
+    assert store.authenticate(rotated_token) is None
     status = store.list_status()[0]
     assert status.revoked
-    assert rotated.token not in repr(status)
+    assert rotated_token not in repr(status)
 
 
 def test_local_authentication_cli_displays_a_token_once_only(tmp_path, capsys):
@@ -649,7 +653,7 @@ def test_authentication_failure_request_id_rate_limit_and_audit(tmp_path):
     events = [item[0] for item in service.audit_events]
     assert "api.authentication_failed" in events
     assert "api.authentication_succeeded" in events
-    assert credential.token not in repr(service.audit_events)
+    assert credential.token.reveal(purpose="audit redaction test") not in repr(service.audit_events)
 
 
 def test_scope_enforcement_and_identity_cannot_be_spoofed(tmp_path):

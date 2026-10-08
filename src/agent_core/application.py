@@ -15,13 +15,19 @@ from typing import TYPE_CHECKING, Any, ClassVar
 from uuid import UUID
 
 from .api_auth import ApiCredentialStore
+from .approval import DurableApprovalProvider
 from .config import AgentConfig
+from .credential_broker import (
+    CredentialBroker,
+    CredentialValueBackend,
+    create_default_credential_value_backend,
+)
 from .models import ActionKind, ActionRequest, AuditEvent, RiskLevel
 from .persistence import (
     OccurrenceStatus,
     SQLiteTaskStore,
 )
-from .ports import KillSwitch
+from .ports import ApprovalProvider, KillSwitch, VerificationProvider
 from .runtime import AgentRuntime
 from .scheduler import TaskScheduler
 from .secrets import sanitize_exception, sanitize_text, sanitize_value
@@ -30,7 +36,12 @@ from .service import AgentService, SchedulerStatusResponse
 if TYPE_CHECKING:
     from fastapi import FastAPI
 
+    from abilities.registry import AbilityRegistry
+    from abilities.web import WebSearchProvider
     from agent_brain.executor import AgentExecutionLoop
+    from agent_brain.model_router import ModelRouter
+
+    from .web_fetch import SafeWebFetcher
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +67,10 @@ class ApplicationErrorCode(StrEnum):
 
 class AgentApplicationError(RuntimeError):
     def __init__(self, code: ApplicationErrorCode, message: str) -> None:
-        super().__init__(message)
+        safe_message = sanitize_text(message)
+        super().__init__(safe_message)
         self.code = code
-        self.message = sanitize_text(message)
+        self.message = safe_message
 
 
 class ApplicationOwnershipError(AgentApplicationError):
@@ -82,6 +94,7 @@ class AgentApplicationStatus:
     unresolved_occurrences: int
     kill_switch_active: bool | None
     kill_switch_available: bool
+    provider_store_available: bool
     api_status: str
     timestamp: datetime
 
@@ -120,13 +133,16 @@ class ProcessOwnershipLock:
             if not self._ephemeral:
                 self._acquire_os_lock()
             self._held = True
-        except (OSError, ValueError) as error:
+        except (OSError, ValueError):
             if self._file is not None:
                 self._file.close()
                 self._file = None
             with self._registry_lock:
                 self._owned_paths.discard(self._key)
-            raise ApplicationOwnershipError() from error
+            failure = ApplicationOwnershipError()
+        else:
+            return
+        raise failure
 
     def _acquire_os_lock(self) -> None:
         assert self._path is not None
@@ -175,8 +191,17 @@ class ProcessOwnershipLock:
 
 
 class _LocalKillSwitch(KillSwitch):
+    def __init__(self, store: SQLiteTaskStore) -> None:
+        self._store = store
+
     def is_engaged(self) -> bool:
-        return False
+        environment_active = os.environ.get("BOLT_KILL_SWITCH_ACTIVE", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        return environment_active or self._store.kill_switch_active()
 
 
 class _UnavailableActionProvider:
@@ -215,6 +240,13 @@ class AgentApplication:
         database_path: str | Path | None = None,
         *,
         config: AgentConfig | None = None,
+        credential_value_backend: CredentialValueBackend | None = None,
+        workspace_root: str | Path | None = None,
+        web_search_provider: WebSearchProvider | None = None,
+        web_fetcher: SafeWebFetcher | None = None,
+        approval_provider: ApprovalProvider | None = None,
+        verification_provider: VerificationProvider | None = None,
+        model_router: ModelRouter | None = None,
     ) -> None:
         self.database_path = (
             Path(database_path).expanduser()
@@ -222,14 +254,27 @@ class AgentApplication:
             else database_path
         )
         self.config = config or AgentConfig()
+        self.workspace_root = Path(workspace_root).expanduser() if workspace_root is not None else None
+        self._web_search_provider = web_search_provider
+        self._web_fetcher = web_fetcher
+        self._approval_provider = approval_provider
+        self._verification_provider = verification_provider
+        self._model_router = model_router
+        self._credential_value_backend = (
+            credential_value_backend
+            if credential_value_backend is not None
+            else create_default_credential_value_backend()
+        )
         lock_database_path = self.database_path or SQLiteTaskStore.default_path()
         self._ownership = ProcessOwnershipLock(lock_database_path)
         self._state = ApplicationState.NEW
         self._state_lock = threading.RLock()
         self._shutdown_lock = asyncio.Lock()
         self._store: SQLiteTaskStore | None = None
+        self._credential_broker: CredentialBroker | None = None
         self._runtime: AgentRuntime | None = None
         self._executor: AgentExecutionLoop | None = None
+        self._registry: AbilityRegistry | None = None
         self._scheduler: TaskScheduler | None = None
         self._service: AgentService | None = None
         self._api: FastAPI | None = None
@@ -260,6 +305,105 @@ class AgentApplication:
             raise AgentApplicationError(ApplicationErrorCode.NOT_READY, "application is not composed")
         return self._store
 
+    @property
+    def credential_broker(self) -> CredentialBroker:
+        if self._credential_broker is None:
+            raise AgentApplicationError(ApplicationErrorCode.NOT_READY, "application is not composed")
+        return self._credential_broker
+
+    def diagnostics(self) -> dict[str, object]:
+        """Return safe operator checks without exposing credentials or provider output."""
+        available = self._registry.available() if self._registry is not None else ()
+        verification_available = self._verification_provider is not None or (
+            self._registry is not None
+            and bool(available)
+            and all(
+                callable(getattr(self._registry.lookup(name), "verify_action", None))
+                for name in available
+            )
+        )
+        model_configured = self._model_router is not None and bool(self._model_router.providers)
+        web_enabled = "web" in available
+        scheduler_running = False
+        if self._service is not None:
+            try:
+                scheduler_running = self._service.scheduler_status().running
+            except (RuntimeError, ValueError):
+                scheduler_running = False
+        database = (
+            str(self.database_path)
+            if self.database_path is not None
+            else str(SQLiteTaskStore.default_path())
+        )
+        return {
+            "application_state": self.state.value,
+            "database_path": database,
+            "persistence_available": self._store is not None,
+            "database_durable": database != ":memory:",
+            "single_process_owner_held": self._ownership.held,
+            "security_policy": {
+                "allowed_action_kinds": sorted(kind.value for kind in self.config.allowed_actions),
+                "external_integrations_enabled": self.config.enable_external_integrations,
+                "default_deny": True,
+            },
+            "credential_backend_available": (
+                self._credential_broker.backend_available
+                if self._credential_broker is not None
+                else False
+            ),
+            "kill_switch_available": True,
+            "kill_switch_active": (
+                self._runtime.kill_switch_active() if self._runtime is not None else False
+            ),
+            "allowed_action_kinds": sorted(kind.value for kind in self.config.allowed_actions),
+            "registered_abilities": list(available),
+            "browser": {
+                "available": "browser" in available,
+                "status": "enabled" if "browser" in available else "unsupported_not_registered",
+            },
+            "web_search": {"available": web_enabled, "provider": "registered_web_ability" if web_enabled else "disabled"},
+            "web_fetch": {"available": web_enabled, "provider": "registered_web_ability" if web_enabled else "disabled"},
+            "workspace": {"configured": self.workspace_root is not None, "available": "workspace" in available},
+            "external_integrations_enabled": self.config.enable_external_integrations,
+            "approval_provider_available": self._approval_provider is not None,
+            "approval_provider": {
+                "available": self._approval_provider is not None,
+                "mode": "configured" if self._approval_provider is not None else "unavailable",
+            },
+            "verification_provider_available": verification_available,
+            "verification_provider": {
+                "available": verification_available,
+                "mode": "configured" if verification_available else "unavailable",
+            },
+            "model_provider_configured": model_configured,
+            "model_provider": {
+                "configured": model_configured,
+                "provider_count": (
+                    len(self._model_router.providers)
+                    if model_configured and self._model_router is not None
+                    else 0
+                ),
+            },
+            "scheduler": {
+                "available": self._scheduler is not None,
+                "running": scheduler_running,
+            },
+            "recovery_status": self._recovery_status,
+        }
+
+    def set_kill_switch_active(self, active: bool) -> bool:
+        if not self._ownership.held or self._store is None:
+            raise AgentApplicationError(
+                ApplicationErrorCode.NOT_READY,
+                "kill-switch control requires an active application owner",
+            )
+        self._store.set_kill_switch_active(active)
+        self._audit(
+            "safety.kill_switch_activated" if active else "safety.kill_switch_deactivated",
+            active=active,
+        )
+        return self._runtime.kill_switch_active() if self._runtime is not None else active
+
     def start(
         self,
         *,
@@ -267,30 +411,70 @@ class AgentApplication:
         start_scheduler_on_api_start: bool = False,
     ) -> AgentApplicationStatus:
         self._transition(ApplicationState.STARTING)
+        startup_failure: AgentApplicationError | None = None
         try:
             self._validate_config()
             self._ownership.acquire()
             self._store = SQLiteTaskStore(self.database_path)
             self._audit("application.ownership_acquired")
+            if self._approval_provider is None:
+                self._approval_provider = DurableApprovalProvider(self._store)
 
             from abilities.registry import AbilityRegistry
+            from abilities.safety import RegisteredAbilityReconciler, RegisteredAbilityVerifier
+            from abilities.web import WebAbilityProvider
+            from abilities.workspace import WorkspaceAbilityProvider
             from agent_brain.executor import AgentExecutionLoop
 
-            kill_switch = _LocalKillSwitch()
+            kill_switch = _LocalKillSwitch(self._store)
             audit_sink = _AuditSink()
+            registry = AbilityRegistry()
+            if (
+                ActionKind.NETWORK_READ in self.config.allowed_actions
+                and self.config.enable_external_integrations
+            ):
+                registry.register(
+                    WebAbilityProvider(
+                        search_provider=self._web_search_provider,
+                        fetcher=self._web_fetcher,
+                    )
+                )
+            if self.workspace_root is not None:
+                registry.register(WorkspaceAbilityProvider(self.workspace_root))
+            self._registry = registry
+            verification_provider = self._verification_provider or (
+                RegisteredAbilityVerifier(registry) if registry.available() else None
+            )
+            action_reconciler = (
+                RegisteredAbilityReconciler(registry) if registry.available() else None
+            )
             self._runtime = AgentRuntime(
                 self.config,
                 _UnavailableActionProvider(),
                 audit_sink,
                 kill_switch,
+                approval_provider=self._approval_provider,
+                verifier=verification_provider,
                 state_store=self._store,
+                action_reconciler=action_reconciler,
             )
+            self._credential_broker = CredentialBroker(
+                self._store,
+                self._credential_value_backend,
+                self._runtime,
+            )
+            self._runtime.set_credential_broker(self._credential_broker)
             self._executor = AgentExecutionLoop(
-                registry=AbilityRegistry(),
+                registry=registry,
                 config=self.config,
+                approval_provider=self._approval_provider,
+                verifier=verification_provider,
                 audit_sink=audit_sink,
                 kill_switch=kill_switch,
                 state_store=self._store,
+                action_reconciler=action_reconciler,
+                credential_broker=self._credential_broker,
+                model_router=self._model_router,
             )
             self._scheduler = TaskScheduler(self._store, self._runtime)
             self._service = AgentService(
@@ -345,13 +529,14 @@ class AgentApplication:
         except AgentApplicationError as error:
             self._fail_startup(error)
             raise
-        except Exception as error:
-            failure = AgentApplicationError(
+        except Exception as error:  # noqa: BLE001 - startup failures are sanitized at the boundary
+            startup_failure = AgentApplicationError(
                 ApplicationErrorCode.STARTUP_FAILED,
                 "application startup failed: " + sanitize_exception(error),
             )
-            self._fail_startup(failure)
-            raise failure from error
+            self._fail_startup(startup_failure)
+        if startup_failure is not None:
+            raise startup_failure
 
     @property
     def api(self) -> FastAPI:
@@ -394,7 +579,12 @@ class AgentApplication:
             unresolved_actions=unresolved_actions,
             unresolved_occurrences=unresolved_occurrences,
             kill_switch_active=scheduler_status.kill_switch_active if scheduler_status else None,
-            kill_switch_available=False,
+            kill_switch_available=True,
+            provider_store_available=(
+                self._credential_broker.backend_available
+                if self._credential_broker is not None
+                else False
+            ),
             api_status=(
                 "available"
                 if self._api is not None and self.state in {ApplicationState.READY, ApplicationState.DEGRADED}
@@ -520,6 +710,7 @@ class AgentApplication:
             except Exception as error:  # noqa: BLE001 - finish state transition after release attempt
                 failures.append(sanitize_exception(error))
             self._store = None
+            self._credential_broker = None
             self._transition(ApplicationState.STOPPED)
         logger.info("application ownership released")
         if failures:
@@ -573,6 +764,7 @@ class AgentApplication:
         valid = (
             config.max_plan_steps >= 1
             and config.max_replans >= 0
+            and config.max_tool_calls >= 1
             and config.max_model_calls >= 1
             and config.max_total_tokens >= 1
             and config.max_task_duration_ms >= 1
@@ -617,6 +809,7 @@ class AgentApplication:
             except Exception:  # noqa: BLE001 - continue startup rollback
                 logger.error("application store cleanup failed during startup rollback")
             self._store = None
+        self._credential_broker = None
         try:
             self._ownership.release()
         except Exception:  # noqa: BLE001 - ownership release is part of startup rollback

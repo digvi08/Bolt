@@ -6,16 +6,18 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import sys
-from collections.abc import Mapping, Sequence
-from dataclasses import fields, is_dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import is_dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from typing import NoReturn, TextIO, cast
 from uuid import UUID
 
 from .application import AgentApplication
-from .models import ActionKind
+from .config import load_config
+from .models import ActionKind, ApprovalRequest, CredentialCallerId, CredentialId
 from .persistence import ScheduleType
 from .secrets import sanitize_text, sanitize_value
 from .service import (
@@ -33,6 +35,38 @@ from .service import (
 
 class CliUsageError(ValueError):
     pass
+
+
+class _ConsoleApprovalProvider:
+    def __init__(
+        self,
+        input_func: Callable[[str], str],
+        output: TextIO,
+    ) -> None:
+        self._input = input_func
+        self._output = output
+
+    def approve(self, request: ApprovalRequest) -> bool:
+        parameters = json.dumps(
+            sanitize_value(request.action.parameters),
+            ensure_ascii=True,
+            sort_keys=True,
+            default=str,
+        )
+        self._output.write(
+            "Approval required\n"
+            f"  Action: {sanitize_text(request.action.name)}\n"
+            f"  Kind: {sanitize_text(str(request.action.kind))}\n"
+            f"  Risk: {request.decision.risk.value}\n"
+            f"  Parameters: {parameters}\n"
+            "Approve this action? [y/N] "
+        )
+        self._output.flush()
+        try:
+            answer = self._input("")
+        except EOFError:
+            return False
+        return answer.strip().casefold() == "y"
 
 
 class _Parser(argparse.ArgumentParser):
@@ -80,6 +114,9 @@ def _build_parser() -> _Parser:
     parser.add_argument("--debug", action="store_true", help="include a sanitized diagnostic")
     parser.add_argument("--no-color", action="store_true", help="disable color (the CLI is plain text)")
     commands = parser.add_subparsers(dest="top", required=True, parser_class=_Parser)
+
+    doctor = commands.add_parser("doctor", help="diagnose local runtime configuration")
+    _json_flag(doctor)
 
     task = commands.add_parser("task", help="inspect and submit tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True, parser_class=_Parser)
@@ -139,6 +176,21 @@ def _build_parser() -> _Parser:
         command.add_argument("schedule_id")
         _json_flag(command)
 
+    approval = commands.add_parser("approval", help="review durable action approvals")
+    approval_commands = approval.add_subparsers(
+        dest="approval_command", required=True, parser_class=_Parser
+    )
+    approval_list = approval_commands.add_parser("list", help="list pending approvals")
+    approval_list.add_argument("--limit", type=_positive_int, default=100)
+    _json_flag(approval_list)
+    approval_show = approval_commands.add_parser("show", help="show approval metadata")
+    approval_show.add_argument("approval_id")
+    _json_flag(approval_show)
+    for operation in ("approve", "deny"):
+        command = approval_commands.add_parser(operation, help=f"{operation} a pending approval")
+        command.add_argument("approval_id")
+        _json_flag(command)
+
     scheduler = commands.add_parser("scheduler", help="control the in-process scheduler")
     scheduler_commands = scheduler.add_subparsers(dest="scheduler_command", required=True, parser_class=_Parser)
     for operation in ("status", "run-once", "start", "stop", "shutdown"):
@@ -161,24 +213,52 @@ def _build_parser() -> _Parser:
     safety_commands = safety.add_subparsers(dest="safety_command", required=True, parser_class=_Parser)
     safety_status = safety_commands.add_parser("status")
     _json_flag(safety_status)
+    kill_switch = safety_commands.add_parser("kill-switch", help="control the persistent local kill switch")
+    kill_switch_commands = kill_switch.add_subparsers(
+        dest="kill_switch_command",
+        required=True,
+        parser_class=_Parser,
+    )
+    for operation in ("status", "engage", "release"):
+        command = kill_switch_commands.add_parser(operation)
+        _json_flag(command)
+
+    credential = commands.add_parser("credential", help="inspect or revoke local credential metadata")
+    credential_commands = credential.add_subparsers(
+        dest="credential_command",
+        required=True,
+        parser_class=_Parser,
+    )
+    credential_list = credential_commands.add_parser("list", help="list metadata for one caller")
+    credential_list.add_argument("--caller-id", default="local")
+    _json_flag(credential_list)
+    credential_status = credential_commands.add_parser("status", help="show credential metadata")
+    credential_status.add_argument("credential_id")
+    _json_flag(credential_status)
+    credential_revoke = credential_commands.add_parser("revoke", help="revoke a credential")
+    credential_revoke.add_argument("credential_id")
+    _json_flag(credential_revoke)
     return parser
 
 
 def _public(value: object) -> object:
     if is_dataclass(value) and not isinstance(value, type):
-        return {item.name: _public(getattr(value, item.name)) for item in fields(value)}
+        return _public(sanitize_value(value))
+    if isinstance(value, Mapping):
+        safe = sanitize_value(value)
+        return {str(key): _public(item) for key, item in safe.items()}
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, (datetime, UUID)):
         return value.isoformat() if isinstance(value, datetime) else str(value)
-    if isinstance(value, Mapping):
-        return sanitize_value({str(key): _public(item) for key, item in value.items()})
     if isinstance(value, (tuple, list)):
         return [_public(item) for item in value]
     if isinstance(value, str):
         return sanitize_text(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return sanitize_value(value)
     raise TypeError("unsupported public response type")
 
 
@@ -254,6 +334,10 @@ def _dispatch(
     application: AgentApplication | None = None,
 ) -> object:
     top = args.top
+    if top == "doctor":
+        if application is None:
+            raise CliUsageError("doctor requires the owned local application")
+        return application.diagnostics()
     if top == "task":
         if args.task_command == "submit":
             return service.submit_task(
@@ -312,6 +396,14 @@ def _dispatch(
         if args.schedule_command == "disable":
             return service.disable_schedule(args.schedule_id)
         return service.cancel_schedule(args.schedule_id)
+    if top == "approval":
+        if args.approval_command == "list":
+            return service.list_approvals(limit=args.limit)
+        if args.approval_command == "show":
+            return service.get_approval(args.approval_id)
+        if args.approval_command == "approve":
+            return service.approve_approval(args.approval_id, actor="local-operator")
+        return service.deny_approval(args.approval_id, actor="local-operator")
     if top == "scheduler":
         if args.scheduler_command == "status":
             return service.scheduler_status()
@@ -343,7 +435,30 @@ def _dispatch(
             limit=args.limit,
         )
     if top == "safety":
+        if args.safety_command == "kill-switch":
+            if application is None:
+                raise CliUsageError("kill-switch controls require the owned local application")
+            if args.kill_switch_command == "engage":
+                return {"active": application.set_kill_switch_active(True)}
+            if args.kill_switch_command == "release":
+                return {"active": application.set_kill_switch_active(False)}
+            return {"active": application.diagnostics()["kill_switch_active"]}
         return service.scheduler_status()
+    if top == "credential":
+        if application is None:
+            raise CliUsageError("credential metadata commands require the owned local application")
+        if args.credential_command == "list":
+            return application.credential_broker.list_metadata(
+                caller_id=CredentialCallerId(args.caller_id)
+            )
+        credential_id = CredentialId(args.credential_id)
+        if args.credential_command == "status":
+            record = application.credential_broker.get_metadata(credential_id)
+            return {
+                "credential": record,
+                "state": application.credential_broker.state(credential_id),
+            }
+        return application.credential_broker.revoke(credential_id)
     raise CliUsageError("unsupported command")
 
 
@@ -385,7 +500,34 @@ def run_cli(
     application: AgentApplication | None = None
     try:
         if service is None:
-            application = AgentApplication(args.database)
+            config_values = {
+                "allowed_actions": os.environ.get("BOLT_ALLOWED_ACTIONS", ""),
+                "approval_required_at": os.environ.get("BOLT_APPROVAL_REQUIRED_AT", "medium"),
+                "max_automatic_risk": os.environ.get("BOLT_MAX_AUTOMATIC_RISK", "low"),
+                "enable_external_integrations": os.environ.get(
+                    "BOLT_ENABLE_EXTERNAL_INTEGRATIONS", "false"
+                ),
+            }
+            from agent_brain.model_router import ModelRouter
+            from agent_brain.remote_model import create_model_provider_from_environment
+
+            model_provider = create_model_provider_from_environment()
+            model_router = (
+                ModelRouter(
+                    providers=[model_provider],
+                    fallback_to_deterministic=False,
+                    max_model_calls=load_config(config_values).max_model_calls,
+                    max_total_tokens=load_config(config_values).max_total_tokens,
+                )
+                if model_provider is not None
+                else None
+            )
+            application = AgentApplication(
+                args.database,
+                config=load_config(config_values),
+                workspace_root=os.environ.get("BOLT_WORKSPACE_ROOT") or None,
+                model_router=model_router,
+            )
             application.start()
             active_service = application.service
         else:
@@ -402,6 +544,9 @@ def run_cli(
                 )
                 if result.task.approval_required:
                     out.write("Approval: required\n")
+                if result.output is not None:
+                    out.write("Result (untrusted external data):\n")
+                    _emit(result.output, as_json=False, out=out)
             if result.error is not None:
                 err.write(f"ERROR: {sanitize_text(result.error.message)}\n")
                 return _error_exit(

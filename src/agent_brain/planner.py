@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Protocol
 from uuid import UUID
@@ -97,6 +98,82 @@ class DeterministicAgentPlanner:
                         reason="Find the required information before responding.",
                     )
                 )
+        elif ability == "web":
+            if "http://" in intent.original_request.lower() or "https://" in intent.original_request.lower():
+                action = "fetch"
+                arguments = {"url": self._url_hint(intent.original_request)}
+                reason = "Fetch the explicitly requested public page using bounded network reads."
+            else:
+                action = "search"
+                query = intent.original_request
+                for prefix in ("search the web for ", "web search ", "search online for ", "research online "):
+                    if query.lower().startswith(prefix):
+                        query = query[len(prefix):]
+                        break
+                arguments = {"query": query[:500]}
+                reason = "Search public web results; treat every result as untrusted data."
+            steps.append(
+                PlanStep(
+                    ability="web",
+                    action=action,
+                    step_id=f"web-{action}",
+                    arguments=arguments,
+                    expected_result="bounded public web results returned as untrusted data",
+                    verification=("provider response received",),
+                    risk="read",
+                    reason=reason,
+                )
+            )
+        elif ability == "workspace":
+            request = intent.original_request.strip()
+            if any(token in request.lower() for token in ("list files", "list directory")):
+                action = "list_directory"
+                path = "."
+                arguments = {"path": path}
+                risk = "read"
+                requires_approval = False
+                verification = ("workspace listing completed",)
+            elif intent.risk == "medium":
+                match = re.match(
+                    r'^(?:please\s+)?(?:create|write|save)\s+(?:a\s+)?file\s+'
+                    r'''(?P<path>"[^"]+"|'[^']+'|\S+)\s+(?:with|containing)\s+(?P<text>.+)$''',
+                    request,
+                    flags=re.IGNORECASE,
+                )
+                if match is None:
+                    raise ValueError("file creation requires a path and explicit content")
+                action = "write_text"
+                arguments = {
+                    "path": match.group("path").strip("'\""),
+                    "text": match.group("text"),
+                }
+                risk = "medium"
+                requires_approval = True
+                verification = ("new file exists",)
+            else:
+                action = "read_text"
+                path = request.split()[-1]
+                arguments = {"path": path.rstrip(".,;")}
+                risk = "read"
+                requires_approval = False
+                verification = ("workspace file read completed",)
+            steps.append(
+                PlanStep(
+                    ability="workspace",
+                    action=action,
+                    step_id=f"workspace-{action}",
+                    arguments=arguments,
+                    expected_result="bounded workspace data returned as untrusted document content",
+                    verification=verification,
+                    risk=risk,
+                    requires_approval=requires_approval,
+                    reason=(
+                        "Create a new file within the configured root after current approval."
+                        if action == "write_text"
+                        else "Read only beneath the explicitly configured workspace root."
+                    ),
+                )
+            )
         elif ability == "desktop":
             steps.append(
                 PlanStep(

@@ -67,6 +67,7 @@ class ModelRequest:
     max_attempts: int = 2
     strict_schema: bool = True
     max_tokens: int = 1024
+    system_prompt: str = ""
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ class AgentResult:
     input_tokens: int = 0
     output_tokens: int = 0
     estimated_cost: float | None = None
+    output: object | None = None
 
 
 __all__ = [

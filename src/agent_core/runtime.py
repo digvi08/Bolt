@@ -7,6 +7,7 @@ import json
 import sqlite3
 import threading
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
 from functools import partial
@@ -14,11 +15,21 @@ from typing import Protocol, TypeVar, cast
 from uuid import UUID, uuid4
 
 from .config import AgentConfig
+from .credential_broker import (
+    AbilityId,
+    CredentialAccessRequest,
+    CredentialBroker,
+    CredentialCallerId,
+    CredentialId,
+    CredentialScope,
+    ProviderId,
+)
 from .models import (
     ActionKind,
     ActionRequest,
     ApprovalRequest,
     AuditEvent,
+    PolicyDecision,
     Task,
     TaskStatus,
     TrustedInstruction,
@@ -44,7 +55,7 @@ from .ports import (
     RecoveryProvider,
     VerificationProvider,
 )
-from .secrets import sanitize_exception, sanitize_value
+from .secrets import sanitize_error, sanitize_exception, sanitize_value
 from .security import DefaultPolicyEngine
 
 T = TypeVar("T")
@@ -94,6 +105,15 @@ class ActionReconciler(Protocol):
     ) -> ActionReconciliationResult: ...
 
 
+@dataclass(frozen=True)
+class _ActiveCredentialExecution:
+    runtime: AgentRuntime
+    task: Task
+    action: ActionRequest
+    record: ActionExecutionRecord
+    credential_id: CredentialId | None
+
+
 class AgentRuntime:
     def __init__(
         self,
@@ -106,6 +126,7 @@ class AgentRuntime:
         recovery: RecoveryProvider | None = None,
         state_store: TaskStateStore | None = None,
         action_reconciler: ActionReconciler | None = None,
+        credential_broker: CredentialBroker | None = None,
     ) -> None:
         self._config = config
         self._actions = action_provider
@@ -116,6 +137,10 @@ class AgentRuntime:
         self._recovery = recovery
         self._state_store = state_store
         self._action_reconciler = action_reconciler
+        self._credential_broker = credential_broker
+        self._active_credential_execution: ContextVar[_ActiveCredentialExecution | None] = (
+            ContextVar(f"bolt-credential-execution-{id(self)}", default=None)
+        )
         self._safe_retry_actions: set[tuple[UUID, str]] = set()
         self._reconciliation_lock = threading.Lock()
         self._restart_decisions: tuple[tuple[TaskRecord, RestartDecision], ...] = ()
@@ -157,20 +182,33 @@ class AgentRuntime:
         if decision.requires_approval:
             self._set_status(task, TaskStatus.AWAITING_APPROVAL)
             task.approval_state = "pending"
-            approved = self._approval is not None and self._approval.approve(
-                ApprovalRequest(task.id, action, decision)
-            )
+            approval_request = ApprovalRequest(task.id, action, decision)
+            approved = self._approval is not None and self._approval.approve(approval_request)
             if not approved:
+                if self._approval_is_pending(approval_request):
+                    task.approval_state = "pending"
+                    self._persist_task(task)
+                    self._event("approval.pending", task, {"execution_id": action.execution_id})
+                    return ExecutionResult(
+                        False,
+                        reason="action is waiting for durable operator approval",
+                        failure_type="approval_pending",
+                    )
                 task.approval_state = "denied"
                 self._set_status(task, TaskStatus.DENIED)
                 self._event("task.denied", task, {"reason": "approval denied or unavailable"})
                 return ExecutionResult(False, reason="approval denied or unavailable", failure_type="approval_denied")
             task.approval_state = "granted"
 
+        authorization_failure = self._revalidate_before_execution(task, action, decision)
+        if authorization_failure is not None:
+            return authorization_failure
+
         action_record = self._load_or_create_action(task, action)
         if action_record is None:
             return ExecutionResult(False, reason="duplicate or uncertain action is blocked", failure_type="action_recovery_required")
 
+        task.verification_state = "pending"
         try:
             self._set_status(task, TaskStatus.EXECUTING, action_record=action_record, action_status=ActionExecutionStatus.EXECUTING)
         except ActionExecutionConflict:
@@ -183,7 +221,7 @@ class AgentRuntime:
         if self._state_store is not None:
             self._event("action.execution_started", task, {"execution_id": action.execution_id})
         try:
-            value = self._actions.execute(action)
+            value = self._invoke_action_provider(task, action, action_record)
         except ActionNotExecutedError as error:
             action_record.status = ActionExecutionStatus.FAILED
             action_record.outcome = sanitize_exception(error)
@@ -201,7 +239,7 @@ class AgentRuntime:
             self._event("task.failed", task, {"error": sanitize_exception(error)})
             if self._recovery is not None:
                 self._event("recovery.started", task)
-                self._recovery.recover(task.id, error)
+                self._recovery.recover(task.id, sanitize_error(error))
             return ExecutionResult(False, reason="execution outcome uncertain", failure_type="uncertain", retryable=False)
 
         if self._state_store is not None and getattr(value, "success", True) is False:
@@ -262,7 +300,7 @@ class AgentRuntime:
                 verification_reason="no verifier configured",
             )
         self._event("task.succeeded", task)
-        return ExecutionResult(True, value=value)
+        return ExecutionResult(True, value=sanitize_value(value))
 
     async def run_async(
         self, task: Task, action: ActionRequest
@@ -298,18 +336,32 @@ class AgentRuntime:
         if decision.requires_approval:
             self._set_status(task, TaskStatus.AWAITING_APPROVAL)
             task.approval_state = "pending"
-            approved = self._approval is not None and self._approval.approve(
-                ApprovalRequest(task.id, action, decision)
-            )
+            approval_request = ApprovalRequest(task.id, action, decision)
+            approved = self._approval is not None and self._approval.approve(approval_request)
             if not approved:
+                if self._approval_is_pending(approval_request):
+                    task.approval_state = "pending"
+                    self._persist_task(task)
+                    self._event("approval.pending", task, {"execution_id": action.execution_id})
+                    return ExecutionResult(
+                        False,
+                        reason="action is waiting for durable operator approval",
+                        failure_type="approval_pending",
+                    )
                 task.approval_state = "denied"
                 self._set_status(task, TaskStatus.DENIED)
                 self._event("task.denied", task, {"reason": "approval denied or unavailable"})
                 return ExecutionResult(False, reason="approval denied or unavailable", failure_type="approval_denied")
             task.approval_state = "granted"
+
+        authorization_failure = self._revalidate_before_execution(task, action, decision)
+        if authorization_failure is not None:
+            return authorization_failure
+
         action_record = self._load_or_create_action(task, action)
         if action_record is None:
             return ExecutionResult(False, reason="duplicate or uncertain action is blocked", failure_type="action_recovery_required")
+        task.verification_state = "pending"
         try:
             self._set_status(task, TaskStatus.EXECUTING, action_record=action_record, action_status=ActionExecutionStatus.EXECUTING)
         except ActionExecutionConflict:
@@ -323,7 +375,7 @@ class AgentRuntime:
             self._event("action.execution_started", task, {"execution_id": action.execution_id})
         try:
             action_provider = cast(AsyncActionProvider, self._actions)
-            value = await action_provider.execute_async(action)
+            value = await self._invoke_async_action_provider(task, action, action_record, action_provider)
         except ActionNotExecutedError as error:
             action_record.status = ActionExecutionStatus.FAILED
             action_record.outcome = sanitize_exception(error)
@@ -341,7 +393,7 @@ class AgentRuntime:
             self._event("task.failed", task, {"error": sanitize_exception(error)})
             if self._recovery is not None:
                 self._event("recovery.started", task)
-                self._recovery.recover(task.id, error)
+                self._recovery.recover(task.id, sanitize_error(error))
             return ExecutionResult(False, reason="execution outcome uncertain", failure_type="uncertain", retryable=False)
         if self._state_store is not None and getattr(value, "success", True) is False:
             action_record.status = ActionExecutionStatus.UNCERTAIN
@@ -395,7 +447,192 @@ class AgentRuntime:
                 verification_reason="no verifier configured",
             )
         self._event("task.succeeded", task)
-        return ExecutionResult(True, value=value)
+        return ExecutionResult(True, value=sanitize_value(value))
+
+    def _invoke_action_provider(
+        self,
+        task: Task,
+        action: ActionRequest,
+        record: ActionExecutionRecord,
+    ) -> object:
+        binding_getter = getattr(self._actions, "credential_binding", None)
+        credential_id = binding_getter() if callable(binding_getter) else None
+        token = self._active_credential_execution.set(
+            _ActiveCredentialExecution(self, task, action, record, credential_id)
+        )
+        try:
+            if credential_id is None:
+                return self._actions.execute(action)
+            if self._credential_broker is None:
+                raise RuntimeError("credential broker is unavailable")
+            if action.ability_id is None or action.provider_id is None or action.execution_id is None:
+                raise RuntimeError("credential action identity is incomplete")
+            scope = CredentialScope(
+                caller_id=CredentialCallerId(task.caller_id),
+                ability_id=AbilityId(action.ability_id),
+                provider_id=ProviderId(action.provider_id),
+            )
+            handle = self._credential_broker.issue_handle(
+                credential_id=CredentialId(credential_id),
+                scope=scope,
+                task_id=task.id,
+                execution_id=action.execution_id,
+                runtime_authority=self,
+            )
+            execute_with_handle = getattr(self._actions, "execute_with_credential_handle", None)
+            if not callable(execute_with_handle):
+                raise TypeError("credential-bound provider does not accept scoped handles")
+            return execute_with_handle(action, handle)
+        finally:
+            self._active_credential_execution.reset(token)
+
+    async def _invoke_async_action_provider(
+        self,
+        task: Task,
+        action: ActionRequest,
+        record: ActionExecutionRecord,
+        provider: AsyncActionProvider,
+    ) -> object:
+        binding_getter = getattr(self._actions, "credential_binding", None)
+        credential_id = binding_getter() if callable(binding_getter) else None
+        token = self._active_credential_execution.set(
+            _ActiveCredentialExecution(self, task, action, record, credential_id)
+        )
+        try:
+            if credential_id is None:
+                return await provider.execute_async(action)
+            if self._credential_broker is None:
+                raise RuntimeError("credential broker is unavailable")
+            if action.ability_id is None or action.provider_id is None or action.execution_id is None:
+                raise RuntimeError("credential action identity is incomplete")
+            scope = CredentialScope(
+                caller_id=CredentialCallerId(task.caller_id),
+                ability_id=AbilityId(action.ability_id),
+                provider_id=ProviderId(action.provider_id),
+            )
+            handle = self._credential_broker.issue_handle(
+                credential_id=CredentialId(credential_id),
+                scope=scope,
+                task_id=task.id,
+                execution_id=action.execution_id,
+                runtime_authority=self,
+            )
+            execute_with_handle = getattr(provider, "execute_async_with_credential_handle", None)
+            if not callable(execute_with_handle):
+                raise TypeError("credential-bound provider does not accept scoped handles")
+            return await execute_with_handle(action, handle)
+        finally:
+            self._active_credential_execution.reset(token)
+
+    def authorize_credential_access(self, request: CredentialAccessRequest) -> bool:
+        active = self._active_credential_execution.get()
+        if active is None or active.runtime is not self:
+            return False
+        task, action, record = active.task, active.action, active.record
+        identity_matches = (
+            request.task_id == task.id
+            and request.execution_id == action.execution_id
+            and request.scope.caller_id == task.caller_id
+            and action.ability_id is not None
+            and request.scope.ability_id == action.ability_id
+            and action.provider_id is not None
+            and request.scope.provider_id == action.provider_id
+            and active.credential_id is not None
+            and request.credential_id == active.credential_id
+            and request.credential_version >= 1
+        )
+        if not identity_matches:
+            self._event(
+                "credential.access_denied",
+                task,
+                {
+                    "credential_id": request.credential_id,
+                    "decision_reason": "action_identity_mismatch",
+                },
+            )
+            return False
+        if self._kill_switch.is_engaged():
+            self._event(
+                "credential.access_denied",
+                task,
+                {
+                    "credential_id": request.credential_id,
+                    "decision_reason": "kill_switch_active",
+                },
+            )
+            return False
+        if (
+            record.status is not ActionExecutionStatus.EXECUTING
+            or record.name != action.name
+            or record.metadata.get("identity_fingerprint") != self._action_fingerprint(action)
+        ):
+            self._event(
+                "credential.access_denied",
+                task,
+                {
+                    "credential_id": request.credential_id,
+                    "decision_reason": "persisted_action_mismatch",
+                },
+            )
+            return False
+        if self._state_store is not None:
+            persisted = self._state_store.get_action(task.id, action.execution_id or "")
+            if (
+                persisted is None
+                or persisted.status is not ActionExecutionStatus.EXECUTING
+                or persisted.name != action.name
+                or persisted.metadata.get("identity_fingerprint") != self._action_fingerprint(action)
+            ):
+                self._event(
+                    "credential.access_denied",
+                    task,
+                    {
+                        "credential_id": request.credential_id,
+                        "decision_reason": "persisted_action_mismatch",
+                    },
+                )
+                return False
+        decision = self._policy.evaluate(action)
+        if not decision.allowed:
+            self._event(
+                "credential.access_denied",
+                task,
+                {
+                    "credential_id": request.credential_id,
+                    "decision_reason": "current_policy_denied",
+                    "risk": decision.risk.value,
+                },
+            )
+            return False
+        if decision.requires_approval:
+            approved = self._approval is not None and self._approval.approve(
+                ApprovalRequest(task.id, action, decision)
+            )
+            if not approved:
+                self._event(
+                    "credential.access_denied",
+                    task,
+                    {
+                        "credential_id": request.credential_id,
+                        "decision_reason": "current_approval_missing",
+                    },
+                )
+                return False
+        self._event(
+            "credential.access_authorized",
+            task,
+            {
+                "credential_id": request.credential_id,
+                "ability_id": request.scope.ability_id,
+                "provider_id": request.scope.provider_id,
+            },
+        )
+        return True
+
+    def set_credential_broker(self, broker: CredentialBroker) -> None:
+        if self._credential_broker is not None:
+            raise ValueError("credential broker is already configured")
+        self._credential_broker = broker
 
     def _event(self, event_type: str, task: Task, details: dict[str, object] | None = None) -> None:
         event = AuditEvent(event_type, task.id, details=sanitize_value(details or {}))
@@ -414,6 +651,59 @@ class AgentRuntime:
                         )
                     )
                 raise
+
+    def _revalidate_before_execution(
+        self,
+        task: Task,
+        action: ActionRequest,
+        approved_decision: PolicyDecision,
+    ) -> ExecutionResult | None:
+        if self._kill_switch.is_engaged():
+            task.termination_reason = "kill switch engaged before provider execution"
+            self._set_status(task, TaskStatus.STOPPED)
+            self._event(
+                "action.blocked_by_kill_switch",
+                task,
+                {"execution_id": action.execution_id, "phase": "before_provider"},
+            )
+            return ExecutionResult(
+                False,
+                reason="kill switch engaged",
+                failure_type="kill_switch",
+            )
+        current_decision = self._policy.evaluate(action)
+        if not current_decision.allowed:
+            self._set_status(task, TaskStatus.DENIED)
+            self._event(
+                "action.blocked_by_current_policy",
+                task,
+                {"execution_id": action.execution_id, "reason": current_decision.reason},
+            )
+            return ExecutionResult(
+                False,
+                reason=current_decision.reason,
+                failure_type="policy_denied",
+            )
+        if (
+            current_decision.risk != approved_decision.risk
+            or current_decision.requires_approval != approved_decision.requires_approval
+        ):
+            self._set_status(task, TaskStatus.DENIED)
+            self._event(
+                "action.authorization_changed",
+                task,
+                {"execution_id": action.execution_id},
+            )
+            return ExecutionResult(
+                False,
+                reason="current authorization changed after approval",
+                failure_type="policy_denied",
+            )
+        return None
+
+    def _approval_is_pending(self, request: ApprovalRequest) -> bool:
+        checker = getattr(self._approval, "is_pending", None)
+        return bool(callable(checker) and checker(request))
 
     def _persistence_call(self, task: Task | TaskRecord, operation: Callable[[], T]) -> T:
         try:
@@ -459,6 +749,8 @@ class AgentRuntime:
                     "kind": self._kind_value(action.kind),
                     "parameters": sanitize_value(action.parameters),
                     "identity_fingerprint": fingerprint,
+                    "ability_id": action.ability_id,
+                    "provider_id": action.provider_id,
                 },
             )
         store = self._state_store
@@ -519,6 +811,8 @@ class AgentRuntime:
                     "provider_identity": self._provider_identity(action.name),
                     "parameters": sanitize_value(action.parameters),
                     "identity_fingerprint": fingerprint,
+                    "ability_id": action.ability_id,
+                    "provider_id": action.provider_id,
                 },
             )
             self._persistence_call(
@@ -1054,6 +1348,10 @@ class AgentRuntime:
             "kind": cls._kind_value(action.kind),
             "parameters": sanitize_value(action.parameters),
         }
+        if action.ability_id is not None:
+            identity["ability_id"] = str(action.ability_id)
+        if action.provider_id is not None:
+            identity["provider_id"] = str(action.provider_id)
         canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -1069,6 +1367,8 @@ class AgentRuntime:
         fingerprint = metadata.get("identity_fingerprint")
         parameters = metadata.get("parameters")
         kind_value = metadata.get("kind")
+        ability_value = metadata.get("ability_id")
+        provider_value = metadata.get("provider_id")
         if (
             not isinstance(provider_identity, str)
             or not provider_identity
@@ -1090,6 +1390,8 @@ class AgentRuntime:
             kind=kind,
             parameters=parameters,
             execution_id=record.action_id,
+            ability_id=AbilityId(ability_value) if isinstance(ability_value, str) else None,
+            provider_id=ProviderId(provider_value) if isinstance(provider_value, str) else None,
         )
         if self._action_fingerprint(action) != fingerprint:
             return None

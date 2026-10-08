@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from .secrets import sanitize_exception
+from .secrets import Secret, sanitize_exception
 
 
 class ApiScope(StrEnum):
@@ -44,6 +44,12 @@ class ApiScope(StrEnum):
     AUDIT_READ = "audit.read"
     AUDIT_READ_ANY = "audit.read:any"
     SAFETY_READ = "safety.read"
+    APPROVAL_READ = "approval.read"
+    APPROVAL_READ_ANY = "approval.read:any"
+    APPROVAL_APPROVE = "approval.approve"
+    APPROVAL_APPROVE_ANY = "approval.approve:any"
+    APPROVAL_DENY = "approval.deny"
+    APPROVAL_DENY_ANY = "approval.deny:any"
 
 
 @dataclass(frozen=True)
@@ -55,7 +61,7 @@ class ApiPrincipal:
 @dataclass(frozen=True)
 class IssuedCredential:
     credential_id: str
-    token: str
+    token: Secret[str]
     scopes: frozenset[ApiScope]
 
 
@@ -111,7 +117,7 @@ class ApiCredentialStore:
             self._write(state)
             return IssuedCredential(
                 credential_id,
-                f"bolt.{credential_id}.{token_secret}",
+                Secret(f"bolt.{credential_id}.{token_secret}"),
                 normalized,
             )
 
@@ -130,7 +136,7 @@ class ApiCredentialStore:
             self._write(state)
             return IssuedCredential(
                 credential_id,
-                f"bolt.{credential_id}.{token_secret}",
+                Secret(f"bolt.{credential_id}.{token_secret}"),
                 scopes,
             )
 

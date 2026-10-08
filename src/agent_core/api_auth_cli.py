@@ -38,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         "credential_id": credential.credential_id,
                         "scopes": sorted(scope.value for scope in credential.scopes),
-                        "token": credential.token,
+                        "token": credential.token.reveal(purpose="one-time local CLI display"),
                         "warning": "Save this token now; it will not be displayed again.",
                     },
                     separators=(",", ":"),
@@ -51,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
                     {
                         "credential_id": credential.credential_id,
                         "scopes": sorted(scope.value for scope in credential.scopes),
-                        "token": credential.token,
+                        "token": credential.token.reveal(purpose="one-time local CLI display"),
                         "warning": "Save this token now; it will not be displayed again.",
                     },
                     separators=(",", ":"),

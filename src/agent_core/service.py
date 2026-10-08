@@ -14,10 +14,19 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Protocol
 from uuid import UUID, uuid4
 
-from .models import ActionKind, ActionRequest, AuditEvent, TaskStatus
+from .approval import ApprovalView
+from .models import (
+    LOCAL_CREDENTIAL_CALLER,
+    ActionKind,
+    ActionRequest,
+    AuditEvent,
+    CredentialCallerId,
+    TaskStatus,
+)
 from .persistence import (
     ActionExecutionRecord,
     ActionExecutionStatus,
+    ApprovalStatus,
     IdempotencyConflict,
     OccurrenceStatus,
     ScheduleRecord,
@@ -53,9 +62,10 @@ class ServiceErrorCode(StrEnum):
 
 class AgentServiceError(Exception):
     def __init__(self, code: ServiceErrorCode, message: str) -> None:
-        super().__init__(message)
+        safe_message = sanitize_text(message)
+        super().__init__(safe_message)
         self.code = code
-        self.message = sanitize_text(message)
+        self.message = safe_message
 
 
 @dataclass(frozen=True)
@@ -115,6 +125,7 @@ class SubmitTaskResult:
     success: bool
     duplicate: bool
     error: ServiceErrorInfo | None = None
+    output: object | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +192,13 @@ class ReconciliationResponse:
 
 
 @dataclass(frozen=True)
+class ApprovalActionResponse:
+    approval: ApprovalView
+    task: TaskStatusResponse | None = None
+    resumed: bool = False
+
+
+@dataclass(frozen=True)
 class SchedulerStatusResponse:
     running: bool
     shutdown: bool
@@ -200,6 +218,7 @@ class TaskExecutor(Protocol):
         *,
         context: ContextManager | None = None,
         task_id: UUID | None = None,
+        caller_id: CredentialCallerId = LOCAL_CREDENTIAL_CALLER,
     ) -> AgentResult: ...
 
 
@@ -238,6 +257,13 @@ _AUDIT_DETAIL_KEYS = frozenset(
         "endpoint",
         "method",
         "status_code",
+        "credential_id",
+        "credential_type",
+        "ability_id",
+        "provider_id",
+        "version",
+        "outcome",
+        "decision_reason",
     }
 )
 
@@ -285,7 +311,11 @@ class AgentService:
             ).hexdigest()
             caller_hash = self._hash_identity(caller_id)
             key_hash = self._hash_identity(key)
-            initial = TaskRecord(task_id=task_id, objective=objective)
+            initial = TaskRecord(
+                task_id=task_id,
+                caller_id=CredentialCallerId(caller_id),
+                objective=objective,
+            )
             try:
                 with self._lock:
                     task_id, created = self._store.register_idempotent_task(
@@ -315,7 +345,11 @@ class AgentService:
             )
 
         try:
-            result = self._task_executor.run(objective, task_id=task_id)
+            result = self._task_executor.run(
+                objective,
+                task_id=task_id,
+                caller_id=CredentialCallerId(caller_id),
+            )
             with self._lock:
                 record = self._store.load_task(task_id)
         except Exception:  # noqa: BLE001 - public boundary converts internal failures to safe typed errors
@@ -332,6 +366,7 @@ class AgentService:
             success=bool(result.success),
             duplicate=False,
             error=submission_error,
+            output=sanitize_value(result.output),
         )
 
     def get_task(self, task_id: UUID | str) -> TaskStatusResponse:
@@ -471,6 +506,95 @@ class AgentService:
             ActionExecutionStatus.RECONCILING,
         }
         return ReconciliationResponse(UUID(str(task_id)), action_id, outcome, still_uncertain)
+
+    def list_approvals(self, *, limit: int = 100) -> tuple[ApprovalView, ...]:
+        self._validate_limit(limit)
+        return tuple(
+            ApprovalView.from_record(record)
+            for record in self._store.list_approvals(limit=limit)
+        )
+
+    def get_approval(self, approval_id: str) -> ApprovalView:
+        record = self._store.get_approval(self._validate_identity(approval_id, "approval_id"))
+        if record is None:
+            raise AgentServiceError(ServiceErrorCode.TASK_NOT_FOUND, "approval not found")
+        return ApprovalView.from_record(record)
+
+    def approve_approval(self, approval_id: str, *, actor: str) -> ApprovalActionResponse:
+        record = self._store.get_approval(self._validate_identity(approval_id, "approval_id"))
+        if record is None:
+            raise AgentServiceError(ServiceErrorCode.TASK_NOT_FOUND, "approval not found")
+        if record.status is not ApprovalStatus.PENDING:
+            raise AgentServiceError(ServiceErrorCode.CONFLICT, "approval is no longer pending")
+        task = self._load_task(record.task_id)
+        if task.status is not TaskStatus.AWAITING_APPROVAL:
+            raise AgentServiceError(ServiceErrorCode.CONFLICT, "task is no longer awaiting approval")
+        decided = self._store.decide_approval(
+            record.approval_id,
+            approve=True,
+            actor=self._validate_identity(actor, "approval actor"),
+            now=datetime.now().astimezone(),
+        )
+        if decided is None or decided.status is not ApprovalStatus.APPROVED:
+            raise AgentServiceError(ServiceErrorCode.CONFLICT, "approval expired or changed")
+        self._audit_service_event(
+            "approval.approved",
+            record.task_id,
+            {"approval_id": record.approval_id, "actor": self._hash_identity(actor)},
+        )
+        try:
+            self._task_executor.run(
+                task.objective,
+                task_id=task.task_id,
+                caller_id=task.caller_id,
+            )
+        except Exception:
+            raise AgentServiceError(
+                ServiceErrorCode.INTERNAL_FAILURE,
+                "approved task could not be resumed; inspect persisted task state",
+            ) from None
+        refreshed = self._store.get_approval(record.approval_id)
+        updated_task = self._store.load_task(record.task_id)
+        if refreshed is None or updated_task is None:
+            raise AgentServiceError(ServiceErrorCode.INTERNAL_FAILURE, "approval state is unavailable")
+        return ApprovalActionResponse(
+            approval=ApprovalView.from_record(refreshed),
+            task=self._task_status(updated_task),
+            resumed=True,
+        )
+
+    def deny_approval(self, approval_id: str, *, actor: str) -> ApprovalActionResponse:
+        record = self._store.get_approval(self._validate_identity(approval_id, "approval_id"))
+        if record is None:
+            raise AgentServiceError(ServiceErrorCode.TASK_NOT_FOUND, "approval not found")
+        if record.status is not ApprovalStatus.PENDING:
+            raise AgentServiceError(ServiceErrorCode.CONFLICT, "approval is no longer pending")
+        task = self._load_task(record.task_id)
+        if task.status is not TaskStatus.AWAITING_APPROVAL:
+            raise AgentServiceError(ServiceErrorCode.CONFLICT, "task is no longer awaiting approval")
+        decided = self._store.decide_approval(
+            record.approval_id,
+            approve=False,
+            actor=self._validate_identity(actor, "approval actor"),
+            now=datetime.now().astimezone(),
+        )
+        if decided is None or decided.status is not ApprovalStatus.DENIED:
+            raise AgentServiceError(ServiceErrorCode.CONFLICT, "approval expired or changed")
+        task.status = TaskStatus.DENIED
+        task.approval_state = "denied"
+        task.current_phase = "approval_denied"
+        task.termination_reason = "operator denied action"
+        self._store.save_task(task)
+        self._audit_service_event(
+            "approval.denied",
+            record.task_id,
+            {"approval_id": record.approval_id, "actor": self._hash_identity(actor)},
+        )
+        return ApprovalActionResponse(
+            approval=ApprovalView.from_record(decided),
+            task=self._task_status(task),
+            resumed=False,
+        )
 
     def create_schedule(self, request: ScheduleRequest) -> ScheduleResponse:
         if not isinstance(request.schedule_type, ScheduleType):

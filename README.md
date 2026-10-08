@@ -1,6 +1,6 @@
 # Personal AI Computer Agent Foundation
 
-A security-first core, deterministic browser layer, and bounded agent-brain planning layer for a personal AI computer agent. Desktop, terminal, filesystem, administrator, and network automation remain unimplemented.
+A security-first core, deterministic browser layer, bounded agent-brain planning layer, public web research, and explicitly rooted workspace reads for a personal AI computer agent. Desktop, terminal, unrestricted filesystem, administrator, authenticated web access, and browser restart reconciliation remain unsupported.
 
 ## Development
 
@@ -14,6 +14,32 @@ mypy src
 ```
 
 The default configuration is deny-by-default. Integrations must implement the interfaces in `src/agent_core/ports.py` and be explicitly allowlisted and tested.
+
+## Local workflows and diagnostics
+
+Run `bolt doctor` (or `bolt doctor --json`) to inspect the database, current allowlist, configured workspace, registered built-in abilities, provider credential-store availability, recovery state, kill-switch state, and whether model, approval, and verification providers are configured. No AI model is enabled by default. Registered web/workspace abilities use bounded provider-specific postcondition checks; no general external-side-effect verifier is configured by default. The CLI supplies a synchronous human approval prompt only when attached to an interactive terminal; embedding applications must inject their own approval provider.
+
+The CLI can enable bounded public web reads only when both `BOLT_ALLOWED_ACTIONS=network_read` and `BOLT_ENABLE_EXTERNAL_INTEGRATIONS=true` are explicitly set. Use `bolt task submit "search the web for ..."` or `bolt task submit "fetch https://example.org/"`. Search uses Bing's public RSS results for personal, non-commercial rendering. Web output is marked as untrusted data and returned separately from task authorization. Fetch follows at most four redirects, resolves and validates every destination, pins the connection to a validated public address, verifies HTTPS certificates, rejects compressed/unsupported/oversized responses, and sends no cookies, credentials, or caller-supplied headers. Ordinary HTTP is supported but reported as insecure. Search-provider availability/rate limits and Bing's usage terms apply.
+
+For bounded workspace access, set `BOLT_WORKSPACE_ROOT` to an existing directory and `BOLT_ALLOWED_ACTIONS=read_only` to list/read using `bolt task submit "list files"` or `bolt task submit "read file notes.txt"`. The ability refuses path escapes and symlinks, caps content and directory sizes, and returns file contents as untrusted document data. Creating a new file is supported only under an existing parent directory and requires the separate `write_file` permission plus current policy approval; an interactive CLI provides a one-shot confirmation, while embedding applications must inject a trusted approval provider. Existing files are never overwritten. If the process exits during file creation, startup reconciliation compares the target with the persisted intent: exact content confirms completion, a missing target confirms no write, and any mismatch remains uncertain and blocked. SQLite and the filesystem are not atomic together. The boundary is intended for a locally controlled workspace; it does not defend against a hostile same-user process racing filesystem path changes.
+
+The local kill switch is persisted with the application database and checked on every runtime decision. Use `bolt safety kill-switch engage` to stop new actions and `bolt safety kill-switch release` to resume them; `bolt safety kill-switch status` reports the effective state. `BOLT_KILL_SWITCH_ACTIVE=true` remains an additional fail-safe override and cannot be cleared by the CLI while asserted. The control is local-only and is not exposed through the HTTP API.
+
+For model planning, set `BOLT_MODEL_BASE_URL` and `BOLT_MODEL_NAME`. Remote endpoints must use HTTPS and require `BOLT_MODEL_API_KEY`; plain HTTP is accepted only for loopback model servers. Supply the key through the process environment rather than a command-line argument. It is held in process memory and is not written to the task database. Model output is validated against registered abilities and current policy; the model cannot grant approval or choose risk, providers, credentials, or verification. Without a model configuration, deterministic planning remains available.
+
+For example, in PowerShell:
+
+```powershell
+$env:BOLT_ALLOWED_ACTIONS = "network_read,read_only"
+$env:BOLT_ENABLE_EXTERNAL_INTEGRATIONS = "true"
+$env:BOLT_WORKSPACE_ROOT = "C:\Users\you\project"
+bolt doctor
+bolt task submit "search the web for Python documentation"
+bolt task submit "read file README.md"
+bolt safety kill-switch status
+```
+
+These environment variables are explicit permissions, not defaults. No external action kind is enabled when they are absent.
 
 ## Persistent task state
 
@@ -34,7 +60,7 @@ The model is a planner/reasoner, not the execution authority. Execution remains 
 
 ## Durable task scheduling
 
-`TaskScheduler` supports one-time (`run_at`) and fixed-interval schedules. Cron expressions are intentionally rejected until their timezone and daylight-saving semantics are explicitly supported. Construct the scheduler with the same `SQLiteTaskStore` and `AgentRuntime` used by the application; scheduled actions are dispatched only through `AgentRuntime.run_async`, so current policy, approval, verification, and kill-switch checks remain in force.
+`TaskScheduler` supports one-time (`run_at`) and fixed-interval schedules. Cron expressions are intentionally rejected until their timezone and daylight-saving semantics are explicitly supported. Construct the scheduler with the same `SQLiteTaskStore` and `AgentRuntime` used by the application; scheduled direct actions are dispatched only through `AgentRuntime.run_async`, so current policy, approval, verification, and kill-switch checks remain in force. Scheduled natural-language objectives do not yet use the model/ability pipeline; do not schedule web research or workspace reports expecting model planning.
 
 Call `await scheduler.run_once()` from an application-owned loop, or `await scheduler.run_forever(stop_event=...)` to poll until stopped. `max_concurrent_tasks` bounds active occurrences. Misfires beyond `misfire_grace_seconds` are recorded and skipped rather than replayed as a burst. Interval schedules skip elapsed intervals and run at most one occurrence per poll.
 
@@ -54,13 +80,21 @@ Typed status responses contain sanitized task/action state and verification stat
 
 The service owns at most one scheduler polling loop. `start_scheduler()` is idempotent, `stop_scheduler()` waits for an active polling cycle and can be followed by a restart, and `shutdown()` performs final scheduler closure. Cron remains an explicit unsupported-capability error. Typed service errors distinguish invalid requests, missing records, policy/approval/kill-switch blocks, conflicts, uncertainty, cancellation errors, unsupported scheduling capabilities, and internal failures. No authentication or remote transport is provided; a future network adapter must add its own caller authentication and authorization.
 
+## Local provider credentials
+
+Provider credentials use a broker separate from API bearer credentials. Each credential record binds a credential ID and type to a caller, registered ability, and provider. Trusted ability registration selects the credential ID; model plans cannot select credential identities or scope. The runtime issues a non-serializable, revocation-aware handle only during the matching provider execution and rechecks the live action journal, caller/action identity, kill switch, current policy, and approval before revealing the value.
+
+SQLite stores credential metadata and audit events only; it has no credential-value column. On Windows, the application uses Windows Credential Manager through the maintained `pywin32` binding when available. Values are stored as generic credentials using the current Windows user’s OS-protected credential store, and each value version carries its credential ID, caller, ability, provider, and version binding. Reads reject mismatched identities. Bolt does not provide its own encryption or key management. On non-Windows systems, or when the Windows API binding/store is unavailable, the backend reports unavailable and operations fail closed; there is no plaintext-file or SQLite fallback. Embedders may inject a compatible backend in local Python composition, but API clients cannot select or inject one.
+
+The application status exposes only whether the provider store is available; it does not expose the OS store location or values. The local `bolt credential list --caller-id <id>`, `bolt credential status <id>`, and `bolt credential revoke <id>` commands expose metadata only. Credential value creation and rotation through CLI/API are unsupported because there is no secure interactive value-entry workflow. There is no API route for provider credential values or remote secret injection. Browser login, authenticated sessions, persistent browser profiles, and credential use in Playwright remain unsupported. Python handles prevent accidental serialization and out-of-scope use; they are not a memory-isolation boundary against malicious code already running in the process.
+
 ## Application lifecycle and process ownership
 
 Production composition is owned by `agent_core.application.AgentApplication`. It constructs exactly one SQLite store, runtime, execution loop, scheduler, and service; an optional API receives that same service. The CLI uses a short-lived application instance for each command; `bolt-api` owns one application until the server exits. Consequently, a CLI command that opens the same durable database while `bolt-api` is running fails closed with an ownership error rather than opening a competing scheduler/runtime.
 
 Startup order is deterministic: acquire exclusive database ownership, open SQLite, construct the runtime (which performs task recovery), construct the execution loop and the one scheduler (which performs occurrence recovery), construct `AgentService`, construct the optional API, inspect unresolved journal state, then publish `READY` or `DEGRADED`. A degraded start means unresolved action/occurrence uncertainty was found; it is reported through authenticated `GET /application/status`, and application-bound API operations other than that status route are rejected. Recovery never replays uncertain provider actions.
 
-The bundled default composition remains providerless and deny-by-default. It does not install a live kill-switch integration; the application status reports `kill_switch_available: false` rather than implying one exists. This lifecycle change does not add providers or replace an application's responsibility to supply a real kill switch before enabling external execution.
+The bundled default composition remains providerless and deny-by-default. It installs one local kill-switch gate combining persistent operator state with the emergency environment override. It does not provide browser abilities, a remote kill-switch API, or a verification provider by default.
 
 For file-backed databases, ownership is enforced with a kernel-managed nonblocking file lock in a sibling `<database-name>.lock` file (by default next to the database in per-user app data). Windows uses the Microsoft CRT byte-range file lock; POSIX systems use `flock`. The lock file may remain after a crash, but it does not represent ownership: the OS releases the lock when the process exits, so the file is reusable. An in-process guard also prevents duplicate application owners. `:memory:` databases are isolated instances and do not use a cross-process lock. The lock is keyed by the resolved database pathname; opening one database through a separate hard-link pathname is not supported. Low-level runners used outside `AgentApplication` do not independently acquire this application lock. This is local single-writer protection, not a distributed lock or multi-host lease. Network filesystems and filesystems that do not honor the platform locking primitive are outside the guarantee. **Bolt does not claim distributed multi-worker support.**
 
@@ -77,7 +111,7 @@ py -m pip install -e .
 bolt --help
 ```
 
-The CLI is a thin local operator interface over `AgentService`; it does not connect directly to providers, change policy, grant approval, change risk, disable the kill switch, or retry uncertain actions. Its default bootstrap has an empty ability registry and deny-by-default configuration, so execution providers must be deliberately wired by an application rather than inferred by the CLI.
+The CLI is a thin local operator interface over `AgentService`; it does not connect directly to action providers, change policy, change risk, or retry uncertain actions. In an interactive terminal, actions requiring approval receive a fresh synchronous confirmation displaying sanitized action details; noninteractive invocations fail closed when approval is unavailable. Its default bootstrap is deny-by-default, and abilities are registered only when their explicit configuration gates are enabled.
 
 Examples:
 
@@ -91,6 +125,7 @@ bolt schedule create --objective "Inspect status" --action-name browser.observe 
 bolt scheduler status
 bolt audit list --task-id <task-uuid> --limit 50 --json
 bolt safety status --json
+bolt safety kill-switch engage
 ```
 
 The persistent database defaults to the documented local application-data location. Override it for a specific invocation by placing `--database <path>` before the command, for example `bolt --database .\agent-state.sqlite3 task list`. Use `--json` on a leaf command for machine-readable DTO output; public strings and errors are sanitized. Exit code `0` means the requested operation completed, `2` indicates invalid CLI input, `3` a missing record, `4` an authorization or policy block, `5` an active kill switch, `6` uncertain/blocked execution, `7` an idempotency conflict, `8` an unsupported capability, and `1` an internal or rejected operation.

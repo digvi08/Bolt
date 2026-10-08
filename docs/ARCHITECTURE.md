@@ -8,7 +8,7 @@ A trusted system or user instruction creates a `Task`. External material is repr
 
 - Unknown and high-risk actions fail closed.
 - No action kind is allowed by default.
-- Browser, desktop, terminal/process, filesystem writes, administrator operations, and network access have no built-in implementation or permission.
+- Browser, desktop, terminal/process, filesystem writes, administrator operations, and general network access have no built-in permission. A bounded public web-read adapter and explicitly rooted workspace adapter are available only when configured and allowlisted.
 - Credentials are never represented as values in task or action models. A `CredentialBroker` may issue only an opaque `CredentialHandle` to a trusted adapter.
 - The model cannot bypass policy, approval, the kill switch, verification, or audit requirements.
 - Untrusted external content cannot become trusted instructions through type conversion in the core.
@@ -51,4 +51,4 @@ The planner produces typed steps with ability names, actions, arguments, verific
 
 ## Current scope
 
-This is the control-plane foundation, deterministic browser layer, and bounded agent-brain planning layer. There is no desktop, unrestricted filesystem, shell/process, administrator, network, credential retrieval, AI browser, or visual-CUA implementation.
+This is the control-plane foundation, deterministic browser layer, bounded agent-brain planning layer, bounded public web-read ability, and explicitly rooted workspace file ability. There is no desktop, unrestricted filesystem, shell/process, administrator, authenticated web access, general network client, credential retrieval, AI browser, or visual-CUA implementation. The application composition root does not configure a model provider or interactive approval provider by default.

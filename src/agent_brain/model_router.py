@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, TypeVar, cast
 
-from agent_core.secrets import sanitize_text, sanitize_value
+from agent_core.secrets import sanitize_exception, sanitize_text, sanitize_value
 
 from .models import ModelRequest, ModelResponse, ModelUsage
 
@@ -77,15 +77,23 @@ class ModelRouter:
         return candidates[0]
 
     def route(self, request: ModelRequest) -> ModelResponse:
+        request = replace(request, prompt=sanitize_text(request.prompt))
         attempts = min(max(request.max_attempts, 1), max(self.max_attempts, 1), 5)
         for attempt in range(1, attempts + 1):
             if self.calls_made >= self.max_model_calls or self.tokens_used >= self.max_total_tokens:
                 raise RuntimeError("model budget exhausted")
             provider = self.select(request)
             started = time.perf_counter()
+            failure: RuntimeError | None = None
             try:
                 self.calls_made += 1
-                content = sanitize_text(provider.generate(request.prompt, system="planner", max_tokens=request.max_tokens))
+                content = sanitize_text(
+                    provider.generate(
+                        request.prompt,
+                        system=sanitize_text(request.system_prompt or "planner"),
+                        max_tokens=request.max_tokens,
+                    )
+                )
                 latency_ms = int((time.perf_counter() - started) * 1000)
                 if latency_ms > request.latency_budget_ms:
                     raise TimeoutError("model latency budget exceeded")
@@ -125,20 +133,34 @@ class ModelRouter:
                         cost_available=cost_available,
                     ),
                 )
-            except Exception as error:  # pragma: no cover - deterministic fallback path
+            except Exception as error:  # noqa: BLE001 - provider errors must not cross this boundary
                 if isinstance(error, RuntimeError) and "budget" in str(error):
-                    raise RuntimeError(sanitize_text(str(error))) from error
-                if attempt >= self.max_attempts:
-                    raise RuntimeError(sanitize_text("model failure")) from error
+                    failure = RuntimeError(sanitize_text(str(error)))
+                elif attempt >= self.max_attempts:
+                    failure = RuntimeError(sanitize_exception(error))
+            if failure is not None:
+                raise failure
         raise RuntimeError("model routing failed")
 
     def route_structured(self, request: ModelRequest, schema: type[T]) -> ModelResponse:
+        request = replace(request, prompt=sanitize_text(request.prompt))
         provider = self.select(request)
         if self.calls_made >= self.max_model_calls:
             raise RuntimeError("model budget exhausted")
         started = time.perf_counter()
         self.calls_made += 1
-        payload = provider.structured_generate(request.prompt, schema, system="planner")
+        failure: RuntimeError | None = None
+        try:
+            payload = provider.structured_generate(
+                request.prompt,
+                schema,
+                system=sanitize_text(request.system_prompt or "planner"),
+            )
+        except Exception as error:  # noqa: BLE001 - model provider errors cross a trust boundary
+            failure = RuntimeError(sanitize_exception(error))
+        if failure is not None:
+            raise failure
+        payload = sanitize_value(payload)
         if schema is dict and not isinstance(payload, dict):
             raise ValueError("malformed structured model output")
         if hasattr(payload, "__dict__") and not isinstance(payload, dict):
@@ -146,15 +168,15 @@ class ModelRouter:
         if schema is not dict and isinstance(payload, dict):
             try:
                 payload = sanitize_value(vars(schema(**payload)))
-            except (TypeError, ValueError) as error:
-                raise ValueError("malformed structured model output") from error
+            except (TypeError, ValueError):
+                raise ValueError("malformed structured model output") from None
         if isinstance(payload, dict):
             forbidden = {
                 "approval", "approved", "verification", "verified", "policy",
                 "policy_result", "kill_switch", "allowed", "permission",
-                "requires_approval", "risk",
+                "requires_approval", "risk", "providerid", "abilityid",
             }
-            if forbidden.intersection(payload):
+            if _contains_forbidden_authority(payload, forbidden):
                 raise ValueError("model output contains runtime-authority fields")
             if not all(isinstance(key, str) for key in payload):
                 raise ValueError("malformed structured model output")
@@ -200,6 +222,20 @@ class ModelRouter:
                 cost_available=cost_available,
             ),
         )
+
+
+def _contains_forbidden_authority(value: object, forbidden: set[str]) -> bool:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if isinstance(key, str):
+                normalized = "".join(character for character in key.lower() if character.isalnum())
+                if normalized in forbidden or normalized.startswith("credential"):
+                    return True
+            if _contains_forbidden_authority(nested, forbidden):
+                return True
+    elif isinstance(value, list):
+        return any(_contains_forbidden_authority(item, forbidden) for item in value)
+    return False
 
 
 __all__ = ["DeterministicModelProvider", "ModelRouter"]

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
-from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
 from agent_core.models import ActionRequest
 from agent_core.ports import AsyncActionProvider, AuditSink
+from agent_core.secrets import Secret, sanitize_text
 
 from .models import (
     BrowserAction,
@@ -61,22 +61,20 @@ class PlaywrightBrowserProvider(BrowserProvider):
         self._tab_sessions: dict[UUID, UUID] = {}
         self._element_selectors: dict[UUID, dict[str, str]] = {}
         self._session_contexts: dict[UUID, BrowserContext] = {}
+        self._sensitive_fields: set[tuple[UUID, str]] = set()
 
     async def start_session(self, persistent_state_path: str | None = None) -> BrowserSession:
+        if persistent_state_path is not None:
+            raise BrowserError(
+                BrowserErrorKind.INVALID_ACTION,
+                "persistent browser state is unsupported; use an in-memory session",
+            )
         if self._playwright is None:
             self._playwright = await async_playwright().start()
-        session = BrowserSession(
-            persistent=persistent_state_path is not None,
-            state_location=str(Path(persistent_state_path).resolve()) if persistent_state_path else None,
-        )
-        if persistent_state_path:
-            context = await self._playwright.chromium.launch_persistent_context(
-                persistent_state_path, headless=self._headless
-            )
-        else:
-            if self._browser is None:
-                self._browser = await self._playwright.chromium.launch(headless=self._headless)
-            context = await self._browser.new_context()
+        session = BrowserSession()
+        if self._browser is None:
+            self._browser = await self._playwright.chromium.launch(headless=self._headless)
+        context = await self._browser.new_context()
         context.set_default_timeout(self._timeout_ms)
         self._sessions[session.id] = session
         self._contexts[session.id] = context
@@ -111,13 +109,16 @@ class PlaywrightBrowserProvider(BrowserProvider):
 
     async def navigate(self, tab_id: UUID, url: str) -> NavigationResult:
         page = self._page(tab_id)
+        failure: BrowserError | None = None
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=self._timeout_ms)
             return NavigationResult(self._refresh_tab(tab_id), True)
-        except PlaywrightTimeoutError as error:
-            raise BrowserError(BrowserErrorKind.NAVIGATION_TIMEOUT) from error
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE) from error
+        except PlaywrightTimeoutError:
+            failure = BrowserError(BrowserErrorKind.NAVIGATION_TIMEOUT)
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE)
+        if failure is not None:
+            raise failure
 
     async def go_back(self, tab_id: UUID) -> NavigationResult:
         return await self._history(tab_id, "back")
@@ -127,16 +128,20 @@ class PlaywrightBrowserProvider(BrowserProvider):
 
     async def reload(self, tab_id: UUID) -> NavigationResult:
         page = self._page(tab_id)
+        failure: BrowserError | None = None
         try:
             await page.reload(wait_until="domcontentloaded", timeout=self._timeout_ms)
             return NavigationResult(self._refresh_tab(tab_id), True)
-        except PlaywrightTimeoutError as error:
-            raise BrowserError(BrowserErrorKind.NAVIGATION_TIMEOUT) from error
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE) from error
+        except PlaywrightTimeoutError:
+            failure = BrowserError(BrowserErrorKind.NAVIGATION_TIMEOUT)
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE)
+        if failure is not None:
+            raise failure
 
     async def observe(self, tab_id: UUID) -> BrowserObservation:
         page = self._page(tab_id)
+        failure: BrowserError | None = None
         try:
             raw = await page.locator("button,a,input,select,textarea,[role]").evaluate_all(
                 """elements => elements.filter(element => {
@@ -177,9 +182,13 @@ class PlaywrightBrowserProvider(BrowserProvider):
                     links.append(element)
                 if item["tag_name"] in {"input", "select", "textarea"}:
                     field_type = item["attributes"].get("type") or item["tag_name"]
-                    sensitive = field_type.lower() in {"password", "file"} or any(
+                    sensitive = (
+                        (tab_id, str(item["id"])) in self._sensitive_fields
+                        or field_type.lower() in {"password", "file"}
+                        or any(
                         word in element.accessible_name.text.lower()
                         for word in ("password", "secret", "otp", "token")
+                        )
                     )
                     forms.append(
                         FormField(
@@ -198,46 +207,62 @@ class PlaywrightBrowserProvider(BrowserProvider):
                 forms=tuple(forms),
                 links=tuple(links),
             )
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE) from error
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE)
+        if failure is not None:
+            raise failure
 
     async def click(self, tab_id: UUID, element_id: str) -> BrowserObservation:
         page = self._page(tab_id)
+        failure: BrowserError | None = None
         try:
             await self._locator(tab_id, element_id).click()
             await self._settle(page)
             return await self.observe(tab_id)
-        except PlaywrightTimeoutError as error:
-            raise BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND) from error
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.TRANSIENT) from error
+        except PlaywrightTimeoutError:
+            failure = BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND)
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.TRANSIENT)
+        if failure is not None:
+            raise failure
 
     async def fill(self, tab_id: UUID, element_id: str, value: str, sensitive: bool = False) -> BrowserObservation:
+        if sensitive:
+            self._sensitive_fields.add((tab_id, element_id))
+        failure: BrowserError | None = None
         try:
             await self._locator(tab_id, element_id).fill(value)
             return await self.observe(tab_id)
-        except PlaywrightTimeoutError as error:
-            raise BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND) from error
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.TRANSIENT) from error
+        except PlaywrightTimeoutError:
+            failure = BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND)
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.TRANSIENT)
+        if failure is not None:
+            raise failure
 
     async def select_option(self, tab_id: UUID, element_id: str, option: str) -> BrowserObservation:
+        failure: BrowserError | None = None
         try:
             await self._locator(tab_id, element_id).select_option(option)
             return await self.observe(tab_id)
-        except PlaywrightTimeoutError as error:
-            raise BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND) from error
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.TRANSIENT) from error
+        except PlaywrightTimeoutError:
+            failure = BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND)
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.TRANSIENT)
+        if failure is not None:
+            raise failure
 
     async def press_key(self, tab_id: UUID, element_id: str, key: str) -> BrowserObservation:
+        failure: BrowserError | None = None
         try:
             await self._locator(tab_id, element_id).press(key)
             return await self.observe(tab_id)
-        except PlaywrightTimeoutError as error:
-            raise BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND) from error
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.TRANSIENT) from error
+        except PlaywrightTimeoutError:
+            failure = BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND)
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.TRANSIENT)
+        if failure is not None:
+            raise failure
 
     async def extract_text(self, tab_id: UUID) -> object:
         return (await self.observe(tab_id)).visible_text
@@ -252,6 +277,8 @@ class PlaywrightBrowserProvider(BrowserProvider):
     async def download(self, tab_id: UUID, selector: str | None = None) -> BrowserDownload:
         page = self._page(tab_id)
         target = page if selector is None else page.locator(selector)
+        download = None
+        failure: BrowserError | None = None
         try:
             if selector is None:
                 with page.expect_download() as expected:
@@ -261,8 +288,12 @@ class PlaywrightBrowserProvider(BrowserProvider):
                 with page.expect_download() as expected:
                     await target.click()
                 download = await expected.value
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.TRANSIENT, "download not available") from error
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.TRANSIENT, "download not available")
+        if failure is not None:
+            raise failure
+        if download is None:
+            raise BrowserError(BrowserErrorKind.TRANSIENT, "download not available")
         path = download.path()
         return BrowserDownload(
             filename=download.suggested_filename or download.filename,
@@ -274,14 +305,22 @@ class PlaywrightBrowserProvider(BrowserProvider):
 
     async def screenshot(self, tab_id: UUID) -> Screenshot:
         page = self._page(tab_id)
+        failure: BrowserError | None = None
         try:
             data = await page.screenshot(type="png")
-            return Screenshot(tab_id=tab_id, mime_type="image/png", data=data, url=page.url)
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE) from error
+            return Screenshot(
+                tab_id=tab_id,
+                mime_type="image/png",
+                data=Secret(data),
+                url=page.url,
+            )
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE)
+        if failure is not None:
+            raise failure
 
     async def get_current_url(self, tab_id: UUID) -> str:
-        return str(self._page(tab_id).url)
+        return sanitize_text(str(self._page(tab_id).url))
 
     async def login(self, service: str) -> None:
         raise BrowserError(BrowserErrorKind.INVALID_ACTION, "interactive login is not implemented")
@@ -291,15 +330,18 @@ class PlaywrightBrowserProvider(BrowserProvider):
 
     async def _history(self, tab_id: UUID, direction: str) -> NavigationResult:
         page = self._page(tab_id)
+        failure: BrowserError | None = None
         try:
             result = await (page.go_back() if direction == "back" else page.go_forward())
             if result is not None:
                 await result.wait_for_load_state("domcontentloaded", timeout=self._timeout_ms)
             return NavigationResult(self._refresh_tab(tab_id), True)
-        except PlaywrightTimeoutError as error:
-            raise BrowserError(BrowserErrorKind.NAVIGATION_TIMEOUT) from error
-        except PlaywrightError as error:
-            raise BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE) from error
+        except PlaywrightTimeoutError:
+            failure = BrowserError(BrowserErrorKind.NAVIGATION_TIMEOUT)
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE)
+        if failure is not None:
+            raise failure
 
     async def _settle(self, page: Page) -> None:
         try:
@@ -321,6 +363,9 @@ class PlaywrightBrowserProvider(BrowserProvider):
         self._tabs.pop(tab_id, None)
         self._tab_sessions.pop(tab_id, None)
         self._element_selectors.pop(tab_id, None)
+        self._sensitive_fields = {
+            item for item in self._sensitive_fields if item[0] != tab_id
+        }
 
     def _context(self, session_id: UUID) -> BrowserContext:
         context = self._contexts.get(session_id)
@@ -362,7 +407,7 @@ class PlaywrightBrowserProvider(BrowserProvider):
         accessible_name = str(item["accessible_name"])
         sensitive = field_type.lower() in {"password", "file"} or any(
             word in accessible_name.lower() for word in ("password", "secret", "otp", "token")
-        )
+        ) or (tab_id, element_id) in self._sensitive_fields
         return BrowserElement(
             id=element_id,
             role=str(item["role"]),
@@ -423,7 +468,12 @@ class BrowserActionProvider(AsyncActionProvider):
             except BrowserError as error:
                 if self._recovery is None:
                     raise
-                recovery = await self._recovery.recover(action.tab_id or action.session_id, error, attempt)
+                safe_error = BrowserError(error.kind, error.safe_message)
+                recovery = await self._recovery.recover(
+                    action.tab_id or action.session_id,
+                    safe_error,
+                    attempt,
+                )
                 self._audit_event("browser.recovery.attempted", action, {"attempt": attempt + 1})
                 if not recovery.recovered or attempt >= 2:
                     raise

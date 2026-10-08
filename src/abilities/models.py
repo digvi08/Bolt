@@ -6,7 +6,17 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 from uuid import UUID, uuid4
 
-from agent_core.models import ActionKind, RiskLevel, Task
+from agent_core.credential_broker import CredentialHandle
+from agent_core.models import (
+    LOCAL_CREDENTIAL_CALLER,
+    AbilityId,
+    ActionKind,
+    CredentialCallerId,
+    CredentialId,
+    ProviderId,
+    RiskLevel,
+    Task,
+)
 
 
 @dataclass(frozen=True)
@@ -19,12 +29,15 @@ class AbilityDescriptor:
     risk_classes: tuple[str, ...] = ()
     required_permissions: tuple[str, ...] = ()
     provider: str = ""
+    credential_id: CredentialId | None = None
 
 
 @dataclass(frozen=True)
 class AbilityContext:
     task_id: UUID
     task: Task | None = None
+    caller_id: CredentialCallerId = LOCAL_CREDENTIAL_CALLER
+    credential_handle: CredentialHandle | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -68,6 +81,8 @@ __all__ = [
     "AbilityActionAdapter",
     "AbilityContext",
     "AbilityDescriptor",
+    "AbilityId",
     "AbilityProvider",
     "AbilityResult",
+    "ProviderId",
 ]

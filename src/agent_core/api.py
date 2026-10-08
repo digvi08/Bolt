@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import fields, is_dataclass
+from dataclasses import is_dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -335,23 +335,22 @@ class ApiMiddleware:
 
 def _jsonable(value: object) -> object:
     if is_dataclass(value) and not isinstance(value, type):
-        return {
-            item.name: _jsonable(getattr(value, item.name))
-            for item in fields(value)
-        }
+        return _jsonable(sanitize_value(value))
+    if isinstance(value, Mapping):
+        safe = sanitize_value(value)
+        return {str(key): _jsonable(item) for key, item in safe.items()}
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, (datetime, UUID)):
         return value.isoformat() if isinstance(value, datetime) else str(value)
-    if isinstance(value, Mapping):
-        safe = sanitize_value({str(key): _jsonable(item) for key, item in value.items()})
-        return safe
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
     if isinstance(value, str):
         return sanitize_text(value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return sanitize_value(value)
     raise TypeError("unsupported service response type")
 
 
@@ -645,6 +644,84 @@ def create_api_app(
             scope=ApiScope.ACTION_RECONCILE,
         )
         result = service.request_reconciliation(action.task_id, action_id)
+        return JSONResponse(content=_jsonable(result))
+
+    @app.get("/approvals", response_model=list[dict[str, Any]])
+    def list_approvals(
+        principal: ApiPrincipal = Depends(require_scope(ApiScope.APPROVAL_READ)),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> JSONResponse:
+        approvals = service.list_approvals(limit=limit)
+        if ApiScope.APPROVAL_READ_ANY not in principal.scopes:
+            approvals = tuple(
+                approval
+                for approval in approvals
+                if credential_store.owns_resource("task", approval.task_id, principal.caller_id)
+            )
+        return JSONResponse(content=_jsonable(approvals))
+
+    @app.get("/approvals/{approval_id}", response_model=dict[str, Any])
+    def get_approval(
+        approval_id: str,
+        principal: ApiPrincipal = Depends(require_scope(ApiScope.APPROVAL_READ)),
+    ) -> JSONResponse:
+        approval = service.get_approval(approval_id)
+        ensure_resource_access(
+            principal,
+            "task",
+            approval.task_id,
+            allow_any_scope=ApiScope.APPROVAL_READ_ANY,
+        )
+        return JSONResponse(content=_jsonable(approval))
+
+    @app.post("/approvals/{approval_id}/approve", response_model=dict[str, Any])
+    async def approve_action(
+        approval_id: str,
+        request: Request,
+        principal: ApiPrincipal = Depends(require_scope(ApiScope.APPROVAL_APPROVE)),
+    ) -> JSONResponse:
+        if request.query_params or await request.body():
+            raise ApiException(ApiErrorCode.INVALID_REQUEST, status_code=422)
+        approval = service.get_approval(approval_id)
+        ensure_resource_access(
+            principal,
+            "task",
+            approval.task_id,
+            allow_any_scope=ApiScope.APPROVAL_APPROVE_ANY,
+        )
+        result = service.approve_approval(approval_id, actor=principal.caller_id)
+        audit(
+            "api.approval_approved",
+            request,
+            principal,
+            task_id=UUID(approval.task_id),
+            scope=ApiScope.APPROVAL_APPROVE,
+        )
+        return JSONResponse(content=_jsonable(result))
+
+    @app.post("/approvals/{approval_id}/deny", response_model=dict[str, Any])
+    async def deny_action(
+        approval_id: str,
+        request: Request,
+        principal: ApiPrincipal = Depends(require_scope(ApiScope.APPROVAL_DENY)),
+    ) -> JSONResponse:
+        if request.query_params or await request.body():
+            raise ApiException(ApiErrorCode.INVALID_REQUEST, status_code=422)
+        approval = service.get_approval(approval_id)
+        ensure_resource_access(
+            principal,
+            "task",
+            approval.task_id,
+            allow_any_scope=ApiScope.APPROVAL_DENY_ANY,
+        )
+        result = service.deny_approval(approval_id, actor=principal.caller_id)
+        audit(
+            "api.approval_denied",
+            request,
+            principal,
+            task_id=UUID(approval.task_id),
+            scope=ApiScope.APPROVAL_DENY,
+        )
         return JSONResponse(content=_jsonable(result))
 
     @app.post("/schedules", response_model=dict[str, Any])
