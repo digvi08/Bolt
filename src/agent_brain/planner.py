@@ -29,6 +29,11 @@ class DeterministicAgentPlanner:
         steps: list[PlanStep] = []
 
         if ability == "browser":
+            if intent.goal in {TaskGoal.FILL_FORM, TaskGoal.SUBMIT_FORM}:
+                raise ValueError(
+                    "browser form actions require a model-driven plan with explicit values "
+                    "and verifiable outcomes"
+                )
             steps.append(
                 PlanStep(
                     ability="browser",
@@ -45,9 +50,9 @@ class DeterministicAgentPlanner:
             steps.append(
                 PlanStep(
                     ability="browser",
-                    action="observe",
-                    step_id="observe-page",
-                    arguments={"target": "page"},
+                    action="inspect",
+                    step_id="inspect-page",
+                    arguments={},
                     preconditions=("page loaded",),
                     expected_result="page content inspected",
                     verification=("observation captured",),
@@ -55,49 +60,6 @@ class DeterministicAgentPlanner:
                     reason="Inspect the page to identify the required target or form.",
                 )
             )
-            if intent.goal in {TaskGoal.FILL_FORM, TaskGoal.SUBMIT_FORM}:
-                steps.append(
-                    PlanStep(
-                        ability="browser",
-                        action="fill",
-                        step_id="fill-name",
-                        arguments={"target_id": "name", "value": "demo-user"},
-                        preconditions=("registration form available",),
-                        expected_result="form field populated",
-                        verification=("field value matches",),
-                        risk="medium",
-                        reason="Fill the required field with a validated value.",
-                    )
-                )
-            if intent.goal is TaskGoal.SUBMIT_FORM:
-                steps.append(
-                    PlanStep(
-                        ability="browser",
-                        action="submit",
-                        step_id="submit-form",
-                        arguments={"target_id": "submit"},
-                        preconditions=("form validated",),
-                        expected_result="submission completed safely",
-                        verification=("confirmation observed", "submission verified"),
-                        risk="high",
-                        reason="A consequential submit is gated by approval and verification.",
-                        requires_approval=True,
-                    )
-                )
-            else:
-                steps.append(
-                    PlanStep(
-                        ability="browser",
-                        action="observe",
-                        step_id="observe-target",
-                        arguments={"target": "target"},
-                        preconditions=("required information visible",),
-                        expected_result="target information captured",
-                        verification=("target found",),
-                        risk="read",
-                        reason="Find the required information before responding.",
-                    )
-                )
         elif ability == "web":
             if "http://" in intent.original_request.lower() or "https://" in intent.original_request.lower():
                 action = "fetch"

@@ -60,7 +60,7 @@ class Provider:
     descriptor = AbilityDescriptor(
         name="browser",
         description="test provider",
-        supported_actions=("navigate", "observe", "fill", "submit"),
+        supported_actions=("navigate", "inspect", "observe", "fill", "submit"),
         risk_classes=("low", "medium", "high"),
         provider="test",
     )
@@ -340,7 +340,7 @@ def test_task_cancellation_is_durable_and_terminal_cancellation_is_rejected(tmp_
     store.close()
 
 
-def test_schedule_api_exposes_state_and_explicitly_rejects_cron(tmp_path):
+def test_schedule_api_exposes_state_and_requires_cron_expression(tmp_path):
     service, store, _, _, _ = make_service(tmp_path)
     run_at = datetime.now(UTC) + timedelta(hours=1)
     request = ScheduleRequest(
@@ -371,7 +371,7 @@ def test_schedule_api_exposes_state_and_explicitly_rejects_cron(tmp_path):
                 schedule_type=ScheduleType.CRON,
             )
         )
-    assert error.value.code is ServiceErrorCode.UNSUPPORTED_CAPABILITY
+    assert error.value.code is ServiceErrorCode.INVALID_REQUEST
     store.close()
 
 

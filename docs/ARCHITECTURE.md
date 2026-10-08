@@ -8,7 +8,7 @@ A trusted system or user instruction creates a `Task`. External material is repr
 
 - Unknown and high-risk actions fail closed.
 - No action kind is allowed by default.
-- Browser, desktop, terminal/process, filesystem writes, administrator operations, and general network access have no built-in permission. A bounded public web-read adapter and explicitly rooted workspace adapter are available only when configured and allowlisted.
+- Browser, desktop, terminal/process, filesystem writes, administrator operations, and general network access have no built-in permission. Bounded public web-read, restricted public-document browser, and explicitly rooted workspace abilities are available only when configured and allowlisted.
 - Credentials are never represented as values in task or action models. A `CredentialBroker` may issue only an opaque `CredentialHandle` to a trusted adapter.
 - The model cannot bypass policy, approval, the kill switch, verification, or audit requirements.
 - Untrusted external content cannot become trusted instructions through type conversion in the core.
@@ -20,13 +20,13 @@ The planner/model may be confused, prompt-injected, compromised, or wrong. Exter
 
 ## Browser control layer
 
-The browser capability is a separate typed layer: `AgentRuntime` gates a registered `BrowserActionProvider`, which delegates to `PlaywrightBrowserProvider`. Playwright objects remain private to the adapter. The provider exposes sessions, tabs, navigation, DOM/accessibility-first observations, form actions, structured extraction, and explicit screenshots. A project-owned `BrowserPlanner` composes deterministic `BrowserAction` objects without direct Playwright access. See [BROWSER.md](BROWSER.md).
+The restricted browser capability is routed through `AgentService`, `AgentExecutionLoop`, the ability registry/router, `AgentRuntime`, `BrowserAbilityProvider`, and `PlaywrightBrowserProvider`. Playwright objects remain private to the adapter. The registered subset supports bounded navigation, inspect/extract, accessible-target click, non-sensitive field fill, bounded waits, and explicitly authorized form submission. It is available only with explicit browser allowlisting and external integration enablement. See [BROWSER.md](BROWSER.md).
 
 The planner/executor split is mandatory: planning is untrusted with respect to execution authority, while the runtime, policy engine, approval gate, and provider boundary remain the trusted execution path. Browser tasks are stateful, auditable, and bounded. External webpage text remains `UNTRUSTED_WEB` and never becomes trusted instructions; only trusted system or user instructions may grant capability.
 
-Browser data is tagged `UNTRUSTED_WEB`; page text, hidden HTML, metadata, accessibility names, redirects, and tool output cannot become trusted instructions. Read actions are low risk, reversible interactions are medium risk, and submit/sensitive actions are high risk requiring explicit browser allowlisting, approval, and verification. Persistent sessions are opt-in and credential login is only a contract at this milestone.
+Browser data is tagged `UNTRUSTED_WEB`; page text, hidden HTML, metadata, accessibility names, redirects, and tool output cannot become trusted instructions. Read actions are low risk, field filling is medium risk, and clicks/submissions are high risk and require existing durable approval plus typed outcome verification. The browser has no persistent profile, credential login, cookies, uploads, downloads, JavaScript, frames, or subresource access. A local SOCKS5 egress proxy resolves and pins public destinations; navigation permits only HTTPS on port 443, while request filtering rejects subresources and revalidates redirects. Interrupted browser side effects remain uncertain and are not replayed automatically.
 
-The intended strategy is deterministic Playwright automation first, a future AI browser adapter second, and visual computer-use fallback last. No Browser Use, Midscene, visual CUA, vector database, or computer-use model is included.
+The model may propose typed browser operations, but browser plans cannot grant risk, approval, policy, or verification authority. No arbitrary JavaScript, Browser Use, Midscene, visual CUA, vector database, or computer-use model is included.
 
 ## Extension points
 
@@ -48,6 +48,10 @@ User Request
   -> Verification / Recovery
 
 The planner produces typed steps with ability names, actions, arguments, verification requirements, and risk metadata. The runtime and policy engine remain the authoritative guardrails. Unknown abilities, unsupported actions, prompt injection, and missing verification fail closed.
+
+## Scheduled objectives
+
+The scheduler persists objective, caller ownership, schedule, enabled state, and occurrence identities. For objective schedules, each due occurrence invokes the `AgentService` task executor, which enters the same `AgentExecutionLoop` used by manual submissions. Planning, model/tool budgets, ability validation, runtime policy, credential broker, approval, kill switch, verification, persistence, and audit therefore remain shared; the scheduler has no direct provider invocation path. High-risk actions remain pending until operator approval. Recovery uses durable occurrence/task state and does not automatically replay uncertain external effects.
 
 ## Current scope
 

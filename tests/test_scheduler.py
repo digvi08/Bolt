@@ -22,7 +22,7 @@ from agent_core.persistence import (
     ScheduleType,
     SQLiteTaskStore,
 )
-from agent_core.runtime import AgentRuntime
+from agent_core.runtime import AgentRuntime, ExecutionResult
 from agent_core.scheduler import ScheduledTask, TaskScheduler
 
 
@@ -112,6 +112,8 @@ def scheduled(
     interval_seconds: int | None = None,
     deadline_at: datetime | None = None,
     timeout: float | None = None,
+    cron_expression: str | None = None,
+    timezone_policy: str = "UTC",
 ) -> ScheduledTask:
     task_id = uuid4()
     return ScheduledTask(
@@ -127,6 +129,8 @@ def scheduled(
         interval_seconds=interval_seconds,
         deadline_at=deadline_at,
         execution_timeout_seconds=timeout,
+        cron_expression=cron_expression,
+        timezone_policy=timezone_policy,
     )
 
 
@@ -508,14 +512,78 @@ def test_run_forever_dispatches_due_schedule_until_stopped(tmp_path):
     asyncio.run(scenario())
 
 
-def test_cron_is_rejected_without_adding_a_cron_dependency(tmp_path):
+def test_weekday_cron_schedule_is_persisted_without_a_cron_dependency(tmp_path):
     now = datetime(2030, 1, 1, tzinfo=UTC)
     store = SQLiteTaskStore(tmp_path / "state.db")
     provider = AsyncProvider()
     scheduler = TaskScheduler(store, make_runtime(store, provider), clock=lambda: now)
 
-    with pytest.raises(ValueError, match="cron schedules are not supported"):
-        scheduler.create(
-            scheduled(run_at=now, schedule_type=ScheduleType.CRON)
+    schedule = scheduler.create(
+        scheduled(
+            run_at=now,
+            schedule_type=ScheduleType.CRON,
+            cron_expression="0 8 * * 1-5",
+            timezone_policy="UTC",
         )
+    )
+    assert schedule.next_run_at == datetime(2030, 1, 1, 8, tzinfo=UTC)
+    assert schedule.cron_expression == "0 8 * * 1-5"
+    assert schedule.timezone_policy == "UTC"
+    assert provider.calls == 0
     store.close()
+
+
+def test_interrupted_objective_planning_is_uncertain_and_not_redelivered(tmp_path):
+    now = datetime(2030, 1, 1, tzinfo=UTC)
+    database_path = tmp_path / "state.db"
+    store = SQLiteTaskStore(database_path)
+    provider = AsyncProvider()
+    scheduler = TaskScheduler(store, make_runtime(store, provider), clock=lambda: now)
+    schedule = scheduler.create(
+        ScheduledTask(
+            objective="research a topic and save a report",
+            action=None,
+            run_at=now,
+            execution_mode="objective",
+            caller_id="research-operator",
+        )
+    )
+    occurrence = store.create_due_occurrence(schedule.schedule_id, now)
+    assert occurrence is not None
+    occurrence.status = OccurrenceStatus.DISPATCHING
+    store.update_occurrence(occurrence)
+    occurrence.status = OccurrenceStatus.RUNNING
+    store.update_occurrence(occurrence)
+    store.save_task(
+        Task(
+            instruction=TrustedInstruction("research a topic and save a report"),
+            id=occurrence.task_id,
+            objective="research a topic and save a report",
+            caller_id="research-operator",
+            current_phase="planning",
+        )
+    )
+    store.close()
+
+    reopened = SQLiteTaskStore(database_path)
+    fresh_provider = AsyncProvider()
+    recovered_scheduler = TaskScheduler(
+        reopened,
+        make_runtime(reopened, fresh_provider),
+        clock=lambda: now,
+    )
+    dispatches = []
+    recovered_scheduler.set_objective_executor(
+        lambda objective, task_id, caller_id: (
+            dispatches.append((objective, task_id, caller_id))
+            or ExecutionResult(True)
+        )
+    )
+
+    recovered = reopened.list_occurrences(schedule.schedule_id)[0]
+    assert recovered.status is OccurrenceStatus.UNCERTAIN
+    assert "restarted during dispatch" in recovered.failure_reason
+    assert asyncio.run(recovered_scheduler.run_once()) == []
+    assert dispatches == []
+    assert fresh_provider.calls == 0
+    reopened.close()

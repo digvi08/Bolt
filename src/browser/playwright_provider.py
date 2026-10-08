@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from collections.abc import Mapping
 from typing import Any
+from urllib.parse import parse_qsl, urljoin, urlsplit
 from uuid import UUID, uuid4
 
-from agent_core.models import ActionRequest
-from agent_core.ports import AsyncActionProvider, AuditSink
 from agent_core.secrets import Secret, sanitize_text
 
+from .egress import BrowserEgressError, Socks5EgressProxy
 from .models import (
-    BrowserAction,
-    BrowserActionType,
     BrowserDownload,
     BrowserElement,
     BrowserError,
@@ -28,8 +27,6 @@ from .models import (
     redact_sensitive,
 )
 from .ports import BrowserProvider
-from .recovery import BrowserRecoveryProvider
-from .verification import BrowserVerificationProvider
 
 try:
     from playwright.async_api import (
@@ -52,6 +49,7 @@ class PlaywrightBrowserProvider(BrowserProvider):
     def __init__(self, *, headless: bool = True, timeout_ms: float = 10_000) -> None:
         self._headless = headless
         self._timeout_ms = timeout_ms
+        self._egress = Socks5EgressProxy()
         self._playwright: Any = None
         self._browser: Browser | None = None
         self._contexts: dict[UUID, BrowserContext] = {}
@@ -62,6 +60,9 @@ class PlaywrightBrowserProvider(BrowserProvider):
         self._element_selectors: dict[UUID, dict[str, str]] = {}
         self._session_contexts: dict[UUID, BrowserContext] = {}
         self._sensitive_fields: set[tuple[UUID, str]] = set()
+        self._element_metadata: dict[UUID, dict[str, dict[str, Any]]] = {}
+        self._navigation_hosts: dict[UUID, str] = {}
+        self._submission_permits: dict[UUID, tuple[str, str]] = {}
 
     async def start_session(self, persistent_state_path: str | None = None) -> BrowserSession:
         if persistent_state_path is not None:
@@ -70,12 +71,29 @@ class PlaywrightBrowserProvider(BrowserProvider):
                 "persistent browser state is unsupported; use an in-memory session",
             )
         if self._playwright is None:
+            await self._egress.start()
             self._playwright = await async_playwright().start()
         session = BrowserSession()
         if self._browser is None:
-            self._browser = await self._playwright.chromium.launch(headless=self._headless)
-        context = await self._browser.new_context()
+            self._browser = await self._playwright.chromium.launch(
+                headless=self._headless,
+                proxy={"server": self._egress.address},
+                args=[
+                    "--proxy-bypass-list=<-loopback>",
+                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    "--disable-quic",
+                    "--disable-background-networking",
+                    "--disable-component-update",
+                    "--disable-sync",
+                ],
+            )
+        context = await self._browser.new_context(
+            accept_downloads=False,
+            java_script_enabled=False,
+            service_workers="block",
+        )
         context.set_default_timeout(self._timeout_ms)
+        await context.route("**/*", self._guard_request)
         self._sessions[session.id] = session
         self._contexts[session.id] = context
         self._session_contexts[session.id] = context
@@ -96,6 +114,8 @@ class PlaywrightBrowserProvider(BrowserProvider):
         if not self._contexts and self._playwright is not None:
             await self._playwright.stop()
             self._playwright = None
+        if not self._contexts:
+            await self._egress.close()
 
     async def new_tab(self, session_id: UUID) -> BrowserTab:
         context = self._context(session_id)
@@ -109,6 +129,8 @@ class PlaywrightBrowserProvider(BrowserProvider):
 
     async def navigate(self, tab_id: UUID, url: str) -> NavigationResult:
         page = self._page(tab_id)
+        host = _require_safe_https_url(url)
+        self._navigation_hosts[tab_id] = host
         failure: BrowserError | None = None
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=self._timeout_ms)
@@ -117,6 +139,8 @@ class PlaywrightBrowserProvider(BrowserProvider):
             failure = BrowserError(BrowserErrorKind.NAVIGATION_TIMEOUT)
         except PlaywrightError:
             failure = BrowserError(BrowserErrorKind.PAGE_LOAD_FAILURE)
+        finally:
+            self._navigation_hosts.pop(tab_id, None)
         if failure is not None:
             raise failure
 
@@ -167,14 +191,26 @@ class PlaywrightBrowserProvider(BrowserProvider):
                             type: element.getAttribute('type') || '',
                             href: element.getAttribute('href') || '',
                         },
+                        form: element.form ? {
+                            action: element.getAttribute('formaction') ||
+                                element.form.getAttribute('action') ||
+                                element.form.action || '',
+                            method: element.getAttribute('formmethod') ||
+                                element.form.getAttribute('method') ||
+                                element.form.method || 'get',
+                        } : null,
                     };
-                })"""
+                }).slice(0, 200)"""
             )
-            body_text = await page.locator("body").inner_text(timeout=self._timeout_ms)
+            body_text = await page.locator("body").evaluate(
+                "element => (element.innerText || '').slice(0, 20000)"
+            )
             title = await page.title()
             elements = []
             forms = []
             links = []
+            self._element_metadata[tab_id] = {}
+            self._element_selectors[tab_id] = {}
             for item in raw:
                 element = self._element(tab_id, item)
                 elements.append(element)
@@ -214,24 +250,95 @@ class PlaywrightBrowserProvider(BrowserProvider):
 
     async def click(self, tab_id: UUID, element_id: str) -> BrowserObservation:
         page = self._page(tab_id)
+        resolved = self._resolve_element(tab_id, element_id)
+        if resolved is None:
+            raise BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND)
+        canonical_id, item = resolved
+        if item.get("tag_name") == "a":
+            href = item.get("attributes", {}).get("href", "")
+            self._navigation_hosts[tab_id] = _require_safe_https_url(
+                page.url if not href else _absolute_url(page.url, href)
+            )
+        elif item.get("attributes", {}).get("type", "").lower() == "submit":
+            raise BrowserError(
+                BrowserErrorKind.INVALID_ACTION,
+                "form controls require the approval-gated submit operation",
+            )
         failure: BrowserError | None = None
         try:
-            await self._locator(tab_id, element_id).click()
+            await self._locator(tab_id, canonical_id).click()
             await self._settle(page)
             return await self.observe(tab_id)
         except PlaywrightTimeoutError:
             failure = BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND)
         except PlaywrightError:
             failure = BrowserError(BrowserErrorKind.TRANSIENT)
+        finally:
+            self._navigation_hosts.pop(tab_id, None)
+        if failure is not None:
+            raise failure
+
+    async def submit(self, tab_id: UUID, element_id: str) -> BrowserObservation:
+        page = self._page(tab_id)
+        resolved = self._resolve_element(tab_id, element_id)
+        canonical_id, item = resolved if resolved is not None else ("", None)
+        form = item.get("form") if item is not None else None
+        if (
+            not isinstance(form, dict)
+            or item is None
+            or item.get("tag_name") not in {"button", "input"}
+            or (
+                item.get("tag_name") == "input"
+                and item.get("attributes", {}).get("type", "").lower() not in {"submit", "image"}
+            )
+            or (
+                item.get("tag_name") == "button"
+                and item.get("attributes", {}).get("type", "").lower() not in {"", "submit"}
+            )
+        ):
+            raise BrowserError(BrowserErrorKind.INVALID_ACTION, "target is not a form submit control")
+        method = str(form.get("method", "get")).upper()
+        destination = _absolute_url(page.url, str(form.get("action") or page.url))
+        _require_safe_https_url(destination)
+        if method not in {"GET", "POST"}:
+            raise BrowserError(BrowserErrorKind.INVALID_ACTION, "unsupported form method")
+        self._submission_permits[tab_id] = (method, destination)
+        failure: BrowserError | None = None
+        try:
+            await self._locator(tab_id, canonical_id).click()
+            await self._settle(page)
+            return await self.observe(tab_id)
+        except PlaywrightTimeoutError:
+            failure = BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND)
+        except PlaywrightError:
+            failure = BrowserError(BrowserErrorKind.TRANSIENT)
+        finally:
+            self._submission_permits.pop(tab_id, None)
         if failure is not None:
             raise failure
 
     async def fill(self, tab_id: UUID, element_id: str, value: str, sensitive: bool = False) -> BrowserObservation:
+        resolved = self._resolve_element(tab_id, element_id)
+        if resolved is None:
+            raise BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND)
+        canonical_id, item = resolved
+        field_type = str(item.get("attributes", {}).get("type", "")).lower()
+        label = str(item.get("accessible_name", "")).lower()
+        if (
+            sensitive
+            or len(value) > 2000
+            or field_type in {"password", "file", "hidden"}
+            or any(word in label for word in ("password", "secret", "otp", "token"))
+        ):
+            raise BrowserError(
+                BrowserErrorKind.INVALID_ACTION,
+                "sensitive or non-text browser fields cannot be filled",
+            )
         if sensitive:
-            self._sensitive_fields.add((tab_id, element_id))
+            self._sensitive_fields.add((tab_id, canonical_id))
         failure: BrowserError | None = None
         try:
-            await self._locator(tab_id, element_id).fill(value)
+            await self._locator(tab_id, canonical_id).fill(value)
             return await self.observe(tab_id)
         except PlaywrightTimeoutError:
             failure = BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND)
@@ -271,37 +378,13 @@ class PlaywrightBrowserProvider(BrowserProvider):
         return (await self.observe(tab_id)).links
 
     async def wait(self, tab_id: UUID, seconds: float = 0.0) -> BrowserObservation:
-        await asyncio.sleep(max(0.0, seconds))
+        if not 0 <= seconds <= 2:
+            raise BrowserError(BrowserErrorKind.INVALID_ACTION, "browser wait must be between 0 and 2 seconds")
+        await asyncio.sleep(seconds)
         return await self.observe(tab_id)
 
     async def download(self, tab_id: UUID, selector: str | None = None) -> BrowserDownload:
-        page = self._page(tab_id)
-        target = page if selector is None else page.locator(selector)
-        download = None
-        failure: BrowserError | None = None
-        try:
-            if selector is None:
-                with page.expect_download() as expected:
-                    await page.locator("a[download]").first.click()
-                download = await expected.value
-            else:
-                with page.expect_download() as expected:
-                    await target.click()
-                download = await expected.value
-        except PlaywrightError:
-            failure = BrowserError(BrowserErrorKind.TRANSIENT, "download not available")
-        if failure is not None:
-            raise failure
-        if download is None:
-            raise BrowserError(BrowserErrorKind.TRANSIENT, "download not available")
-        path = download.path()
-        return BrowserDownload(
-            filename=download.suggested_filename or download.filename,
-            suggested_filename=download.suggested_filename,
-            source_url=download.url,
-            destination=str(path),
-            size=None,
-        )
+        raise BrowserError(BrowserErrorKind.INVALID_ACTION, "browser downloads are disabled")
 
     async def screenshot(self, tab_id: UUID) -> Screenshot:
         page = self._page(tab_id)
@@ -363,6 +446,9 @@ class PlaywrightBrowserProvider(BrowserProvider):
         self._tabs.pop(tab_id, None)
         self._tab_sessions.pop(tab_id, None)
         self._element_selectors.pop(tab_id, None)
+        self._element_metadata.pop(tab_id, None)
+        self._navigation_hosts.pop(tab_id, None)
+        self._submission_permits.pop(tab_id, None)
         self._sensitive_fields = {
             item for item in self._sensitive_fields if item[0] != tab_id
         }
@@ -394,11 +480,37 @@ class PlaywrightBrowserProvider(BrowserProvider):
     def _locator(self, tab_id: UUID, element_id: str) -> Any:
         selector = self._element_selectors.get(tab_id, {}).get(element_id)
         if selector is None:
+            matches = [
+                item_id
+                for item_id, item in self._element_metadata.get(tab_id, {}).items()
+                if item_id == element_id
+                or item.get("attributes", {}).get("name") == element_id
+                or item.get("accessible_name") == element_id
+            ]
+            if len(matches) == 1:
+                selector = self._element_selectors[tab_id][matches[0]]
+        if selector is None:
             raise BrowserError(BrowserErrorKind.ELEMENT_NOT_FOUND, "observed element is no longer available")
         return self._page(tab_id).locator(selector)
 
+    def _resolve_element(
+        self, tab_id: UUID, target: str
+    ) -> tuple[str, dict[str, Any]] | None:
+        metadata = self._element_metadata.get(tab_id, {})
+        exact = metadata.get(target)
+        if exact is not None:
+            return target, exact
+        matches = [
+            (element_id, item)
+            for element_id, item in metadata.items()
+            if item.get("attributes", {}).get("name") == target
+            or item.get("accessible_name") == target
+        ]
+        return matches[0] if len(matches) == 1 else None
+
     def _element(self, tab_id: UUID, item: Mapping[str, Any]) -> BrowserElement:
         element_id = str(item["id"])
+        self._element_metadata.setdefault(tab_id, {})[element_id] = dict(item)
         # The generated ID is only an opaque handle; target selectors never enter model-visible data.
         self._element_selectors.setdefault(tab_id, {})[element_id] = (
             f'[data-agent-element-id="{element_id}"]'
@@ -417,112 +529,100 @@ class PlaywrightBrowserProvider(BrowserProvider):
             attributes={str(k): str(v) for k, v in item["attributes"].items() if v},
         )
 
-class BrowserActionProvider(AsyncActionProvider):
-    """Runtime bridge: browser actions are registered, then resolved after policy approval."""
+    async def _guard_request(self, route: Any) -> None:
+        if not self._request_is_allowed(route):
+            await route.abort("blockedbyclient")
+            return
+        await route.continue_()
 
-    def __init__(self, browser: PlaywrightBrowserProvider, audit_sink: AuditSink | None = None) -> None:
-        self.browser = browser
-        self._audit = audit_sink
-        self._actions: dict[str, tuple[BrowserAction, ActionRequest]] = {}
-        self._active_task_ids: dict[UUID, UUID] = {}
-        self._verifier: BrowserVerificationProvider | None = None
-        self._recovery: BrowserRecoveryProvider | None = None
-
-    def configure_safety(
-        self,
-        verifier: BrowserVerificationProvider | None = None,
-        recovery: BrowserRecoveryProvider | None = None,
-    ) -> None:
-        self._verifier = verifier
-        self._recovery = recovery
-
-    def register(self, action: BrowserAction, task_id: UUID | None = None) -> ActionRequest:
-        request = action.to_action_request(task_id)
-        self._actions[str(action.id)] = (action, request)
-        return request
-
-    async def execute_async(self, request: ActionRequest) -> object:
-        action_id = str(request.parameters.get("browser_action_id", ""))
-        registered = self._actions.pop(action_id, None)
-        if registered is None:
-            raise BrowserError(BrowserErrorKind.INVALID_ACTION, "browser action is not registered")
-        action, registered_request = registered
-        self._active_task_ids[action.id] = registered_request.task_id
-        self._audit_event("browser.action.started", action, {"risk": action.risk.value})
-        result = await self._execute_with_recovery(action)
-        if action.risk.value in {"high", "unknown"}:
-            if self._verifier is None:
-                raise BrowserError(BrowserErrorKind.INVALID_ACTION, "verification is required for consequential actions")
-            verification = await self._verifier.verify(action, result)
-            if not verification.verified:
-                raise BrowserError(BrowserErrorKind.TRANSIENT, "browser state verification failed")
-            self._audit_event("browser.action.verified", action, {"verified": True})
-        self._audit_event("browser.action.completed", action, {"result": type(result).__name__})
-        self._active_task_ids.pop(action.id, None)
-        return result
-
-    async def _execute_with_recovery(self, action: BrowserAction) -> object:
-        for attempt in range(3):
-            try:
-                return await self._execute(action)
-            except BrowserError as error:
-                if self._recovery is None:
-                    raise
-                safe_error = BrowserError(error.kind, error.safe_message)
-                recovery = await self._recovery.recover(
-                    action.tab_id or action.session_id,
-                    safe_error,
-                    attempt,
-                )
-                self._audit_event("browser.recovery.attempted", action, {"attempt": attempt + 1})
-                if not recovery.recovered or attempt >= 2:
-                    raise
-        raise BrowserError(BrowserErrorKind.UNKNOWN, "browser recovery exhausted")
-
-    async def _execute(self, action: BrowserAction) -> object:
-        tab_id = action.tab_id
-        if action.type is BrowserActionType.NEW_TAB:
-            return await self.browser.new_tab(action.session_id)
+    def _request_is_allowed(self, route: Any) -> bool:
+        request = route.request
+        try:
+            host = _require_safe_https_url(request.url)
+        except BrowserEgressError:
+            return False
+        if request.frame != request.frame.page.main_frame:
+            return False
+        tab_id = next(
+            (identifier for identifier, page in self._pages.items() if page is request.frame.page),
+            None,
+        )
         if tab_id is None:
-            raise BrowserError(BrowserErrorKind.INVALID_ACTION, "browser tab is required")
-        if action.type is BrowserActionType.NAVIGATE:
-            return await self.browser.navigate(tab_id, action.url or "")
-        if action.type is BrowserActionType.GO_BACK:
-            return await self.browser.go_back(tab_id)
-        if action.type is BrowserActionType.GO_FORWARD:
-            return await self.browser.go_forward(tab_id)
-        if action.type is BrowserActionType.RELOAD:
-            return await self.browser.reload(tab_id)
-        if action.type is BrowserActionType.OBSERVE:
-            return await self.browser.observe(tab_id)
-        if action.type is BrowserActionType.CLICK:
-            return await self.browser.click(tab_id, action.target_id or "")
-        if action.type is BrowserActionType.FILL:
-            return await self.browser.fill(tab_id, action.target_id or "", action.value or "", action.sensitive)
-        if action.type is BrowserActionType.SELECT_OPTION:
-            return await self.browser.select_option(tab_id, action.target_id or "", action.option or "")
-        if action.type is BrowserActionType.PRESS_KEY:
-            return await self.browser.press_key(tab_id, action.target_id or "", action.key or "")
-        if action.type is BrowserActionType.EXTRACT_TEXT:
-            return await self.browser.extract_text(tab_id)
-        if action.type is BrowserActionType.EXTRACT_LINKS:
-            return await self.browser.extract_links(tab_id)
-        if action.type is BrowserActionType.WAIT:
-            return await self.browser.wait(tab_id, float(action.value or "0"))
-        if action.type is BrowserActionType.DOWNLOAD:
-            return await self.browser.download(tab_id, action.target_id)
-        if action.type is BrowserActionType.SCREENSHOT:
-            return await self.browser.screenshot(tab_id)
-        if action.type is BrowserActionType.CLOSE_TAB:
-            await self.browser.close_tab(tab_id)
-            return None
-        if action.type is BrowserActionType.SUBMIT:
-            return await self.browser.click(tab_id, action.target_id or "")
-        raise BrowserError(BrowserErrorKind.INVALID_ACTION, "unsupported browser action")
+            return False
+        method = request.method.upper()
+        permitted_host = self._navigation_hosts.get(tab_id)
+        permit = self._submission_permits.get(tab_id)
+        if (
+            method in {"GET", "HEAD"}
+            and request.resource_type == "document"
+            and permitted_host == host
+        ):
+            return True
+        if (
+            permit is not None
+            and method == permit[0]
+            and _matches_submission_destination(method, request.url, permit[1])
+            and request.resource_type == "document"
+        ):
+            self._submission_permits.pop(tab_id, None)
+            return True
+        return False
 
-    def _audit_event(self, event_type: str, action: BrowserAction, details: dict[str, object]) -> None:
-        if self._audit is not None:
-            from agent_core.models import AuditEvent
 
-            task_id = self._active_task_ids.get(action.id, action.to_action_request().task_id)
-            self._audit.record(AuditEvent(event_type, task_id, details=details))
+def _matches_submission_destination(method: str, request_url: str, permitted_url: str) -> bool:
+    try:
+        request = urlsplit(request_url)
+        permitted = urlsplit(permitted_url)
+        request_host = _require_safe_https_url(request_url)
+        permitted_host = _require_safe_https_url(permitted_url)
+        if (
+            request_host != permitted_host
+            or request.port not in {None, 443}
+            or permitted.port not in {None, 443}
+            or request.path != permitted.path
+            or request.username is not None
+            or request.password is not None
+        ):
+            return False
+        if method == "GET":
+            return set(parse_qsl(permitted.query, keep_blank_values=True)).issubset(
+                set(parse_qsl(request.query, keep_blank_values=True))
+            )
+        return request.query == permitted.query
+    except (BrowserEgressError, ValueError):
+        return False
+
+
+def _require_safe_https_url(url: str) -> str:
+    try:
+        parsed = urlsplit(url)
+        host = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise BrowserEgressError("browser destination is invalid") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in {None, 443}
+        or host.rstrip(".").lower() == "localhost"
+        or host.rstrip(".").lower().endswith((".localhost", ".local", ".internal"))
+    ):
+        raise BrowserEgressError("browser navigation requires a public HTTPS destination")
+    try:
+        literal = ipaddress.ip_address(host.rstrip("."))
+    except ValueError:
+        literal = None
+    if literal is not None and (
+        getattr(literal, "ipv4_mapped", None) is not None or not literal.is_global
+    ):
+        raise BrowserEgressError("browser destination must resolve to public addresses")
+    try:
+        return host.encode("idna").decode("ascii").lower().rstrip(".")
+    except UnicodeError as error:
+        raise BrowserEgressError("browser destination is invalid") from error
+
+
+def _absolute_url(base: str, value: str) -> str:
+    return urljoin(base, value)

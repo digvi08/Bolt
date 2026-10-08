@@ -187,17 +187,27 @@ def _arguments_are_valid(action: str, arguments: dict[str, object]) -> bool:
         "read_text": ({"path"}, {"path"}),
         "list_directory": ({"path"}, set()),
         "write_text": ({"path", "text"}, {"path", "text"}),
-        "navigate": ({"url"}, {"url"}),
-        "fill": ({"target_id", "value"}, {"target_id", "value"}),
-        "click": ({"target_id"}, {"target_id"}),
-        "submit": ({"target_id"}, {"target_id"}),
-        "observe": ({"target"}, set()),
+        "navigate": ({"url", "expected_text", "expected_url"}, {"url"}),
+        "fill": ({"target_id", "value", "expected_text", "expected_url"}, {"target_id", "value"}),
+        "click": ({"target_id", "expected_text", "expected_url"}, {"target_id"}),
+        "submit": ({"target_id", "expected_text", "expected_url"}, {"target_id"}),
+        "inspect": ({"target", "expected_text", "expected_url", "expected_element"}, set()),
+        "extract": ({"target", "expected_text", "expected_url", "expected_element"}, set()),
+        "wait": ({"seconds"}, set()),
     }.get(action)
     if schemas is None:
         return False
     allowed, required = schemas
     if not set(arguments).issubset(allowed) or not required.issubset(arguments):
         return False
+    if action == "wait":
+        seconds = arguments.get("seconds", 0)
+        return (
+            isinstance(seconds, (int, float))
+            and not isinstance(seconds, bool)
+            and 0 <= seconds <= 2
+            and len(arguments) == 1
+        )
     values = [value for value in arguments.values() if isinstance(value, str)]
     if len(values) != len(arguments):
         return False
@@ -206,6 +216,12 @@ def _arguments_are_valid(action: str, arguments: dict[str, object]) -> bool:
     if action == "search" and len(str(arguments["query"])) > 500:
         return False
     if action == "write_text" and len(str(arguments["text"]).encode("utf-8")) > 256_000:
+        return False
+    if action in {"click", "submit"} and not (
+        isinstance(arguments.get("expected_text"), str)
+        or isinstance(arguments.get("expected_url"), str)
+        or isinstance(arguments.get("expected_element"), str)
+    ):
         return False
     return len(json.dumps(arguments, ensure_ascii=False)) <= 8_000
 

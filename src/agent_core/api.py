@@ -129,8 +129,8 @@ class SubmitTaskBody(BaseModel):
 class ScheduleBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
     objective: str = Field(min_length=1, max_length=8000)
-    action_name: str = Field(min_length=1, max_length=256)
-    action_kind: ActionKind
+    action_name: str | None = Field(default=None, min_length=1, max_length=256)
+    action_kind: ActionKind | None = None
     run_at: datetime
     parameters: dict[str, Any] = Field(default_factory=dict)
     schedule_type: ScheduleType = ScheduleType.RUN_AT
@@ -138,6 +138,9 @@ class ScheduleBody(BaseModel):
     end_at: datetime | None = None
     deadline_at: datetime | None = None
     execution_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    execution_mode: str = "action"
+    cron_expression: str | None = Field(default=None, max_length=128)
+    timezone_policy: str = Field(default="UTC", min_length=1, max_length=128)
 
     @field_validator("run_at", "end_at", "deadline_at")
     @classmethod
@@ -482,8 +485,18 @@ def create_api_app(
     ) -> None:
         if allow_any_scope in principal.scopes:
             return
-        if not credential_store.owns_resource(kind, resource_id, principal.caller_id):
+        owned = credential_store.owns_resource(kind, resource_id, principal.caller_id)
+        if not owned and kind == "task":
+            owned = scheduled_task_owned(resource_id, principal.caller_id)
+        if not owned:
             raise ApiException(ApiErrorCode.NOT_FOUND, status_code=404)
+
+    def scheduled_task_owned(task_id: str, caller_id: str) -> bool:
+        owns_scheduled_task = getattr(service, "owns_scheduled_task", None)
+        return bool(
+            callable(owns_scheduled_task)
+            and owns_scheduled_task(task_id, caller_id)
+        )
 
     @app.exception_handler(ApiException)
     async def handle_api_exception(request: Request, error: ApiException) -> JSONResponse:
@@ -555,6 +568,7 @@ def create_api_app(
                 task
                 for task in tasks
                 if credential_store.owns_resource("task", str(task.task_id), principal.caller_id)
+                or scheduled_task_owned(str(task.task_id), principal.caller_id)
             )
         return JSONResponse(content=_jsonable(tasks))
 
@@ -657,6 +671,7 @@ def create_api_app(
                 approval
                 for approval in approvals
                 if credential_store.owns_resource("task", approval.task_id, principal.caller_id)
+                or scheduled_task_owned(approval.task_id, principal.caller_id)
             )
         return JSONResponse(content=_jsonable(approvals))
 
@@ -742,6 +757,10 @@ def create_api_app(
                 end_at=body.end_at,
                 deadline_at=body.deadline_at,
                 execution_timeout_seconds=body.execution_timeout_seconds,
+                execution_mode=body.execution_mode,
+                caller_id=principal.caller_id,
+                cron_expression=body.cron_expression,
+                timezone_policy=body.timezone_policy,
             )
         )
         credential_store.claim_resource("task", str(result.task_id), principal.caller_id)

@@ -272,6 +272,7 @@ class AgentApplication:
         self._shutdown_lock = asyncio.Lock()
         self._store: SQLiteTaskStore | None = None
         self._credential_broker: CredentialBroker | None = None
+        self._browser_ability: Any | None = None
         self._runtime: AgentRuntime | None = None
         self._executor: AgentExecutionLoop | None = None
         self._registry: AbilityRegistry | None = None
@@ -441,6 +442,14 @@ class AgentApplication:
                 )
             if self.workspace_root is not None:
                 registry.register(WorkspaceAbilityProvider(self.workspace_root))
+            if (
+                ActionKind.BROWSER in self.config.allowed_actions
+                and self.config.enable_external_integrations
+            ):
+                from browser.ability import BrowserAbilityProvider
+
+                self._browser_ability = BrowserAbilityProvider()
+                registry.register(self._browser_ability)
             self._registry = registry
             verification_provider = self._verification_provider or (
                 RegisteredAbilityVerifier(registry) if registry.available() else None
@@ -694,6 +703,12 @@ class AgentApplication:
                     await self._scheduler.close()
                 except Exception as error:  # noqa: BLE001 - continue ordered cleanup
                     failures.append(sanitize_exception(error))
+            if self._browser_ability is not None:
+                try:
+                    self._browser_ability.shutdown()
+                except Exception as error:  # noqa: BLE001 - continue ordered resource cleanup
+                    failures.append(sanitize_exception(error))
+                self._browser_ability = None
             if self._store is not None:
                 try:
                     self._audit("application.shutdown")

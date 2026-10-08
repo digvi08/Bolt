@@ -155,10 +155,13 @@ def _build_parser() -> _Parser:
     schedule_commands = schedule.add_subparsers(dest="schedule_command", required=True, parser_class=_Parser)
     create = schedule_commands.add_parser("create", help="create a one-time or interval schedule")
     create.add_argument("--objective", required=True)
-    create.add_argument("--action-name", required=True)
-    create.add_argument("--action-kind", required=True)
+    create.add_argument("--action-name")
+    create.add_argument("--action-kind")
+    create.add_argument("--execution-mode", choices=("action", "objective"), default="action")
     create.add_argument("--run-at", required=True, type=_datetime)
     create.add_argument("--type", choices=("run_at", "interval", "cron"), default="run_at")
+    create.add_argument("--cron-expression")
+    create.add_argument("--timezone-policy", default="UTC")
     create.add_argument("--interval-seconds", type=_positive_int)
     create.add_argument("--end-at", type=_datetime)
     create.add_argument("--deadline-at", type=_datetime)
@@ -369,10 +372,14 @@ def _dispatch(
                 raise CliUsageError("parameters JSON is invalid") from None
             if not isinstance(parameters, dict):
                 raise CliUsageError("parameters JSON must be an object")
-            try:
-                action_kind = ActionKind(args.action_kind)
-            except ValueError:
-                raise CliUsageError("unsupported action kind") from None
+            action_kind = None
+            if args.execution_mode == "action":
+                if not args.action_name or not args.action_kind:
+                    raise CliUsageError("action schedules require --action-name and --action-kind")
+                try:
+                    action_kind = ActionKind(args.action_kind)
+                except ValueError:
+                    raise CliUsageError("unsupported action kind") from None
             return service.create_schedule(
                 ScheduleRequest(
                     objective=args.objective,
@@ -385,6 +392,9 @@ def _dispatch(
                     end_at=args.end_at,
                     deadline_at=args.deadline_at,
                     execution_timeout_seconds=args.timeout_seconds,
+                    execution_mode=args.execution_mode,
+                    cron_expression=args.cron_expression,
+                    timezone_policy=args.timezone_policy,
                 )
             )
         if args.schedule_command == "get":
@@ -507,6 +517,10 @@ def run_cli(
                 "enable_external_integrations": os.environ.get(
                     "BOLT_ENABLE_EXTERNAL_INTEGRATIONS", "false"
                 ),
+                "max_replans": os.environ.get("BOLT_MAX_REPLANS", "2"),
+                "max_tool_calls": os.environ.get("BOLT_MAX_TOOL_CALLS", "8"),
+                "max_model_calls": os.environ.get("BOLT_MAX_MODEL_CALLS", "3"),
+                "max_total_tokens": os.environ.get("BOLT_MAX_TOTAL_TOKENS", "4096"),
             }
             from agent_brain.model_router import ModelRouter
             from agent_brain.remote_model import create_model_provider_from_environment

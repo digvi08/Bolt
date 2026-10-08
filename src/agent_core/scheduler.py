@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -13,6 +13,7 @@ from .models import (
     ActionKind,
     ActionRequest,
     AuditEvent,
+    CredentialCallerId,
     Task,
     TaskStatus,
     TrustedInstruction,
@@ -24,6 +25,7 @@ from .persistence import (
     ScheduleStatus,
     ScheduleType,
     TaskStateStore,
+    next_weekday_cron_time,
 )
 from .runtime import AgentRuntime, ExecutionResult
 from .secrets import sanitize_value
@@ -32,7 +34,7 @@ from .secrets import sanitize_value
 @dataclass(frozen=True)
 class ScheduledTask:
     objective: str
-    action: ActionRequest
+    action: ActionRequest | None
     run_at: datetime
     schedule_type: ScheduleType = ScheduleType.RUN_AT
     interval_seconds: int | None = None
@@ -41,6 +43,10 @@ class ScheduledTask:
     execution_timeout_seconds: float | None = None
     schedule_id: str = ""
     task_id: UUID | None = None
+    execution_mode: str = "action"
+    caller_id: str = "local"
+    cron_expression: str | None = None
+    timezone_policy: str = "UTC"
 
 
 class TaskScheduler:
@@ -61,6 +67,7 @@ class TaskScheduler:
             raise ValueError("misfire_grace_seconds cannot be negative")
         self._store = store
         self._runtime = runtime
+        self._objective_executor: Callable[[str, UUID, str], ExecutionResult] | None = None
         self._max_concurrent_tasks = max_concurrent_tasks
         self._clock = clock or (lambda: datetime.now(UTC))
         self._misfire_grace_seconds = misfire_grace_seconds
@@ -72,11 +79,18 @@ class TaskScheduler:
         self.recover()
 
     def create(self, scheduled: ScheduledTask) -> ScheduleRecord:
-        if scheduled.schedule_type is ScheduleType.CRON:
-            raise ValueError("cron schedules are not supported")
         if scheduled.run_at.tzinfo is None:
             raise ValueError("scheduled time must be timezone-aware")
-        if scheduled.action.task_id != (scheduled.task_id or scheduled.action.task_id):
+        if scheduled.execution_mode not in {"action", "objective"}:
+            raise ValueError("unsupported scheduled execution mode")
+        if scheduled.execution_mode == "action" and scheduled.action is None:
+            raise ValueError("action schedules require an action request")
+        if scheduled.execution_mode == "objective" and scheduled.action is not None:
+            raise ValueError("objective schedules cannot contain a direct action")
+        if (
+            scheduled.action is not None
+            and scheduled.action.task_id != (scheduled.task_id or scheduled.action.task_id)
+        ):
             raise ValueError("scheduled action/task identity mismatch")
         if scheduled.schedule_type is ScheduleType.INTERVAL and (
             scheduled.interval_seconds is None or scheduled.interval_seconds < 1
@@ -84,10 +98,24 @@ class TaskScheduler:
             raise ValueError("interval schedules require a positive interval")
         if scheduled.schedule_type is ScheduleType.RUN_AT and scheduled.interval_seconds is not None:
             raise ValueError("run-at schedules cannot have an interval")
+        if scheduled.schedule_type is ScheduleType.CRON:
+            if scheduled.interval_seconds is not None or not scheduled.cron_expression:
+                raise ValueError("cron schedules require a supported expression")
+            next_run_at = next_weekday_cron_time(
+                min(self._aware_now(), scheduled.run_at.astimezone(UTC) - timedelta(microseconds=1)),
+                scheduled.cron_expression,
+                scheduled.timezone_policy,
+            )
+        else:
+            if scheduled.cron_expression is not None:
+                raise ValueError("cron expression is valid only for cron schedules")
+            next_run_at = scheduled.run_at.astimezone(UTC)
         if scheduled.execution_timeout_seconds is not None and scheduled.execution_timeout_seconds <= 0:
             raise ValueError("execution timeout must be positive")
 
-        task_id = scheduled.task_id or scheduled.action.task_id
+        task_id = scheduled.task_id or (
+            scheduled.action.task_id if scheduled.action is not None else uuid4()
+        )
         task = self._store.load_task(task_id)
         if task is None:
             self._store.save_task(
@@ -95,6 +123,7 @@ class TaskScheduler:
                     instruction=TrustedInstruction(scheduled.objective),
                     id=task_id,
                     objective=scheduled.objective,
+                    caller_id=CredentialCallerId(scheduled.caller_id),
                     status=TaskStatus.CREATED,
                     current_phase="scheduled",
                 )
@@ -103,21 +132,30 @@ class TaskScheduler:
             schedule_id=scheduled.schedule_id or str(uuid4()),
             task_id=task_id,
             objective=scheduled.objective,
-            action_name=scheduled.action.name,
+            action_name=scheduled.action.name if scheduled.action is not None else "agent.execute_objective",
             action_kind=(
                 scheduled.action.kind.value
-                if isinstance(scheduled.action.kind, ActionKind)
-                else str(scheduled.action.kind)
+                if scheduled.action is not None and isinstance(scheduled.action.kind, ActionKind)
+                else str(scheduled.action.kind) if scheduled.action is not None else ActionKind.UNKNOWN.value
             ),
-            parameters=sanitize_value(scheduled.action.parameters),
+            parameters=sanitize_value(scheduled.action.parameters) if scheduled.action is not None else {},
             schedule_type=scheduled.schedule_type,
-            next_run_at=scheduled.run_at.astimezone(UTC),
+            next_run_at=next_run_at,
             interval_seconds=scheduled.interval_seconds,
             end_at=scheduled.end_at.astimezone(UTC) if scheduled.end_at else None,
             deadline_at=scheduled.deadline_at.astimezone(UTC) if scheduled.deadline_at else None,
             execution_timeout_seconds=scheduled.execution_timeout_seconds,
+            execution_mode=scheduled.execution_mode,
+            caller_id=scheduled.caller_id,
+            cron_expression=scheduled.cron_expression,
+            timezone_policy=scheduled.timezone_policy,
         )
         return self._store.save_schedule(schedule)
+
+    def set_objective_executor(
+        self, executor: Callable[[str, UUID, str], ExecutionResult]
+    ) -> None:
+        self._objective_executor = executor
 
     def enable(self, schedule_id: str, enabled: bool = True) -> ScheduleRecord:
         schedule = self._require_schedule(schedule_id)
@@ -334,6 +372,149 @@ class TaskScheduler:
             updated_at=task_record.updated_at,
             execution_metadata=dict(task_record.execution_metadata),
         )
+        timeout = schedule.execution_timeout_seconds
+        if occurrence.deadline_at is not None:
+            remaining = (occurrence.deadline_at - now).total_seconds()
+            if remaining <= 0:
+                return self._fail_occurrence(occurrence, "task deadline exceeded", "schedule.deadline_exceeded"), False
+            timeout = remaining if timeout is None else min(timeout, remaining)
+        if schedule.execution_mode == "objective":
+            executor = self._objective_executor
+            if executor is None:
+                return self._fail_occurrence(
+                    occurrence,
+                    "scheduled objective executor is unavailable",
+                    "schedule.dispatch_denied",
+                ), False
+            objective_task = asyncio.create_task(
+                asyncio.to_thread(
+                    executor,
+                    schedule.objective,
+                    occurrence.task_id,
+                    schedule.caller_id,
+                )
+            )
+            if timeout is not None:
+                done, _ = await asyncio.wait({objective_task}, timeout=timeout)
+                if not done:
+                    occurrence.status = OccurrenceStatus.UNCERTAIN
+                    occurrence.failure_reason = (
+                        "execution timeout; task pipeline outcome requires recovery"
+                    )
+                    self._store.update_occurrence(occurrence)
+                    late_task = asyncio.create_task(
+                        self._finish_late_dispatch(schedule, occurrence, objective_task)
+                    )
+                    self._background.add(late_task)
+                    late_task.add_done_callback(self._background.discard)
+                    return (
+                        ExecutionResult(
+                            False,
+                            reason=occurrence.failure_reason,
+                            failure_type="uncertain",
+                        ),
+                        True,
+                    )
+            try:
+                result = (
+                    objective_task.result()
+                    if timeout is not None
+                    else await objective_task
+                )
+            except asyncio.CancelledError:
+                occurrence.status = OccurrenceStatus.UNCERTAIN
+                occurrence.failure_reason = "scheduled task pipeline was cancelled while running"
+                self._store.update_occurrence(occurrence)
+                late_task = asyncio.create_task(
+                    self._finish_late_dispatch(schedule, occurrence, objective_task)
+                )
+                self._background.add(late_task)
+                late_task.add_done_callback(self._background.discard)
+                return (
+                    ExecutionResult(False, reason=occurrence.failure_reason, failure_type="uncertain"),
+                    True,
+                )
+            except Exception as error:  # noqa: BLE001 - pipeline failure may have side effects
+                occurrence.status = OccurrenceStatus.UNCERTAIN
+                occurrence.failure_reason = sanitize_value(
+                    f"{type(error).__name__}: {error}"
+                )
+                self._store.update_occurrence(occurrence)
+                self._store.record_audit_event(
+                    AuditEvent(
+                        "schedule.occurrence_uncertain",
+                        occurrence.task_id,
+                        details={
+                            "schedule_id": schedule.schedule_id,
+                            "occurrence_id": occurrence.occurrence_id,
+                        },
+                    )
+                )
+                return (
+                    ExecutionResult(
+                        False,
+                        reason="scheduled task pipeline outcome is uncertain",
+                        failure_type="uncertain",
+                    ),
+                    False,
+                )
+            if result.success:
+                occurrence.status = OccurrenceStatus.COMPLETED
+                occurrence.failure_reason = ""
+                self._store.update_occurrence(occurrence)
+                self._finish_run_at(schedule)
+                self._store.record_audit_event(
+                    AuditEvent(
+                        "schedule.task_completed",
+                        occurrence.task_id,
+                        details={
+                            "schedule_id": schedule.schedule_id,
+                            "occurrence_id": occurrence.occurrence_id,
+                        },
+                    )
+                )
+                return result, False
+            task_record = self._store.load_task(occurrence.task_id)
+            failure_type: str | None
+            if task_record is not None and task_record.status is TaskStatus.AWAITING_APPROVAL:
+                occurrence.status = OccurrenceStatus.AWAITING_APPROVAL
+                event_type = "schedule.approval_pending"
+                failure_type = "approval_pending"
+            else:
+                occurrence.status = (
+                    OccurrenceStatus.UNCERTAIN
+                    if result.failure_type in {"uncertain", "action_recovery_required"}
+                    else OccurrenceStatus.FAILED
+                )
+                event_type = (
+                    "schedule.occurrence_uncertain"
+                    if occurrence.status is OccurrenceStatus.UNCERTAIN
+                    else "schedule.task_failed"
+                )
+                failure_type = result.failure_type
+            occurrence.failure_reason = sanitize_value(result.reason)
+            self._store.update_occurrence(occurrence)
+            self._store.record_audit_event(
+                AuditEvent(
+                    event_type,
+                    occurrence.task_id,
+                    details={
+                        "schedule_id": schedule.schedule_id,
+                        "occurrence_id": occurrence.occurrence_id,
+                        "failure_type": failure_type or "unknown",
+                    },
+                )
+            )
+            if occurrence.status is OccurrenceStatus.FAILED:
+                self._finish_run_at(schedule, failed=True)
+            return result, False
+
+        if schedule.execution_mode != "action":
+            return self._fail_occurrence(
+                occurrence,
+                "unsupported scheduled execution mode",
+                "schedule.dispatch_denied",
+            ), False
         try:
             action_kind = ActionKind(schedule.action_kind)
         except ValueError:
@@ -345,12 +526,6 @@ class TaskScheduler:
             parameters=schedule.parameters,
             execution_id=occurrence.execution_id,
         )
-        timeout = schedule.execution_timeout_seconds
-        if occurrence.deadline_at is not None:
-            remaining = (occurrence.deadline_at - now).total_seconds()
-            if remaining <= 0:
-                return self._fail_occurrence(occurrence, "task deadline exceeded", "schedule.deadline_exceeded"), False
-            timeout = remaining if timeout is None else min(timeout, remaining)
         try:
             runtime_task = asyncio.create_task(self._runtime.run_async(task, action))
             if timeout is None:

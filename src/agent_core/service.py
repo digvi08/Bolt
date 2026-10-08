@@ -36,7 +36,7 @@ from .persistence import (
     TaskStateStore,
     VerificationStatus,
 )
-from .runtime import ActionReconciliationOutcome, AgentRuntime
+from .runtime import ActionReconciliationOutcome, AgentRuntime, ExecutionResult
 from .scheduler import ScheduledTask, TaskScheduler
 from .secrets import sanitize_text, sanitize_value
 
@@ -146,8 +146,8 @@ class SchedulerOccurrenceResponse:
 @dataclass(frozen=True)
 class ScheduleRequest:
     objective: str
-    action_name: str
-    action_kind: ActionKind | str
+    action_name: str | None
+    action_kind: ActionKind | str | None
     run_at: datetime
     parameters: Mapping[str, Any]
     schedule_type: ScheduleType = ScheduleType.RUN_AT
@@ -155,6 +155,10 @@ class ScheduleRequest:
     end_at: datetime | None = None
     deadline_at: datetime | None = None
     execution_timeout_seconds: float | None = None
+    execution_mode: str = "action"
+    caller_id: str = "local"
+    cron_expression: str | None = None
+    timezone_policy: str = "UTC"
 
 
 @dataclass(frozen=True)
@@ -173,6 +177,9 @@ class ScheduleResponse:
     occurrence_count: int
     created_at: datetime
     updated_at: datetime
+    execution_mode: str = "action"
+    cron_expression: str | None = None
+    timezone_policy: str = "UTC"
 
 
 @dataclass(frozen=True)
@@ -286,6 +293,7 @@ class AgentService:
         self._task_executor = task_executor
         self._runtime = runtime
         self._scheduler = scheduler
+        self._scheduler.set_objective_executor(self._run_scheduled_objective)
         self._poll_interval = scheduler_poll_interval_seconds
         self._lock = threading.RLock()
         self._submission_lock = threading.Lock()
@@ -548,7 +556,7 @@ class AgentService:
                 task_id=task.task_id,
                 caller_id=task.caller_id,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - resume boundary preserves the durable pending state
             raise AgentServiceError(
                 ServiceErrorCode.INTERNAL_FAILURE,
                 "approved task could not be resumed; inspect persisted task state",
@@ -557,6 +565,7 @@ class AgentService:
         updated_task = self._store.load_task(record.task_id)
         if refreshed is None or updated_task is None:
             raise AgentServiceError(ServiceErrorCode.INTERNAL_FAILURE, "approval state is unavailable")
+        self._update_scheduled_occurrence(updated_task)
         return ApprovalActionResponse(
             approval=ApprovalView.from_record(refreshed),
             task=self._task_status(updated_task),
@@ -585,6 +594,7 @@ class AgentService:
         task.current_phase = "approval_denied"
         task.termination_reason = "operator denied action"
         self._store.save_task(task)
+        self._update_scheduled_occurrence(task)
         self._audit_service_event(
             "approval.denied",
             record.task_id,
@@ -604,20 +614,20 @@ class AgentService:
                 raise AgentServiceError(ServiceErrorCode.INVALID_REQUEST, "invalid schedule type") from None
         else:
             schedule_type = request.schedule_type
-        if schedule_type is ScheduleType.CRON:
-            raise AgentServiceError(
-                ServiceErrorCode.UNSUPPORTED_CAPABILITY,
-                "cron schedules are not supported",
-            )
         objective = self._validate_objective(request.objective)
-        if not isinstance(request.action_name, str) or not request.action_name.strip():
-            raise AgentServiceError(ServiceErrorCode.INVALID_REQUEST, "action_name is required")
-        try:
-            kind = ActionKind(request.action_kind)
-        except (TypeError, ValueError):
+        if request.execution_mode not in {"action", "objective"}:
+            raise AgentServiceError(ServiceErrorCode.INVALID_REQUEST, "invalid scheduled execution mode")
+        if request.execution_mode == "action":
+            if not isinstance(request.action_name, str) or not request.action_name.strip():
+                raise AgentServiceError(ServiceErrorCode.INVALID_REQUEST, "action_name is required")
+            try:
+                kind = ActionKind(request.action_kind)
+            except (TypeError, ValueError):
+                kind = ActionKind.UNKNOWN
+            if kind is ActionKind.UNKNOWN:
+                raise AgentServiceError(ServiceErrorCode.INVALID_REQUEST, "unknown action kind is denied")
+        else:
             kind = ActionKind.UNKNOWN
-        if kind is ActionKind.UNKNOWN:
-            raise AgentServiceError(ServiceErrorCode.INVALID_REQUEST, "unknown action kind is denied")
         if not isinstance(request.run_at, datetime) or request.run_at.tzinfo is None:
             raise AgentServiceError(ServiceErrorCode.INVALID_REQUEST, "run_at must be timezone-aware")
         if not isinstance(request.parameters, Mapping):
@@ -632,14 +642,19 @@ class AgentService:
                 ServiceErrorCode.INVALID_REQUEST,
                 "parameters must contain JSON-compatible values",
             ) from None
+        caller_id = self._validate_identity(request.caller_id, "caller_id")
         task_id = uuid4()
         scheduled = ScheduledTask(
             objective=objective,
-            action=ActionRequest(
-                task_id=task_id,
-                name=sanitize_text(request.action_name),
-                kind=kind,
-                parameters=safe_parameters,
+            action=(
+                ActionRequest(
+                    task_id=task_id,
+                    name=sanitize_text(request.action_name or ""),
+                    kind=kind,
+                    parameters=safe_parameters,
+                )
+                if request.execution_mode == "action"
+                else None
             ),
             run_at=request.run_at,
             schedule_type=schedule_type,
@@ -648,6 +663,10 @@ class AgentService:
             deadline_at=request.deadline_at,
             execution_timeout_seconds=request.execution_timeout_seconds,
             task_id=task_id,
+            execution_mode=request.execution_mode,
+            caller_id=caller_id,
+            cron_expression=request.cron_expression,
+            timezone_policy=request.timezone_policy,
         )
         try:
             return self._schedule_response(self._scheduler.create(scheduled))
@@ -659,6 +678,14 @@ class AgentService:
         if schedule is None:
             raise AgentServiceError(ServiceErrorCode.SCHEDULE_NOT_FOUND, "schedule not found")
         return self._schedule_response(schedule)
+
+    def owns_scheduled_task(self, task_id: UUID | str, caller_id: str) -> bool:
+        for occurrence in self._store.list_occurrences():
+            if str(occurrence.task_id) != str(task_id):
+                continue
+            schedule = self._scheduler_store_schedule(occurrence.schedule_id)
+            return schedule is not None and schedule.caller_id == caller_id
+        return False
 
     def list_schedules(self, *, limit: int = 100) -> tuple[ScheduleResponse, ...]:
         self._validate_limit(limit)
@@ -937,7 +964,78 @@ class AgentService:
             occurrence_count=record.occurrence_number,
             created_at=record.created_at,
             updated_at=record.updated_at,
+            execution_mode=record.execution_mode,
+            cron_expression=record.cron_expression,
+            timezone_policy=record.timezone_policy,
         )
+
+    def _run_scheduled_objective(
+        self, objective: str, task_id: UUID, caller_id: str
+    ) -> ExecutionResult:
+        result = self._task_executor.run(
+            objective,
+            task_id=task_id,
+            caller_id=CredentialCallerId(caller_id),
+        )
+        task = self._store.load_task(task_id)
+        if result.success:
+            return ExecutionResult(True, value=sanitize_value(result.output))
+        if task is not None and task.status is TaskStatus.AWAITING_APPROVAL:
+            failure_type = "approval_pending"
+        elif task is not None and any(
+            action.status in {
+                ActionExecutionStatus.UNCERTAIN,
+                ActionExecutionStatus.RECONCILING,
+            }
+            or action.verification_status
+            in {VerificationStatus.PENDING, VerificationStatus.FAILED, VerificationStatus.UNCERTAIN}
+            for action in self._store.list_actions(task_id)
+        ):
+            failure_type = "uncertain"
+        else:
+            failure_type = "task_failed"
+        return ExecutionResult(
+            False,
+            reason=sanitize_text(result.reason or "scheduled task did not complete"),
+            failure_type=failure_type,
+        )
+
+    def _update_scheduled_occurrence(self, task: TaskRecord) -> None:
+        for occurrence in self._store.list_occurrences():
+            if occurrence.task_id != task.task_id:
+                continue
+            if task.status is TaskStatus.AWAITING_APPROVAL:
+                occurrence.status = OccurrenceStatus.AWAITING_APPROVAL
+            elif task.status in {TaskStatus.SUCCEEDED, TaskStatus.COMPLETED}:
+                occurrence.status = OccurrenceStatus.COMPLETED
+                occurrence.failure_reason = ""
+            elif task.status is TaskStatus.DENIED:
+                occurrence.status = OccurrenceStatus.FAILED
+                occurrence.failure_reason = "scheduled action approval denied"
+            elif task.status in {TaskStatus.FAILED, TaskStatus.STOPPED, TaskStatus.ABORTED}:
+                actions = self._store.list_actions(task.task_id)
+                occurrence.status = (
+                    OccurrenceStatus.UNCERTAIN
+                    if any(
+                        action.status
+                        in {ActionExecutionStatus.UNCERTAIN, ActionExecutionStatus.RECONCILING}
+                        for action in actions
+                    )
+                    else OccurrenceStatus.FAILED
+                )
+                occurrence.failure_reason = sanitize_text(task.last_error or task.termination_reason)
+            self._store.update_occurrence(occurrence)
+            self._store.record_audit_event(
+                AuditEvent(
+                    "schedule.occurrence_updated_after_approval",
+                    task.task_id,
+                    details={
+                        "schedule_id": occurrence.schedule_id,
+                        "occurrence_id": occurrence.occurrence_id,
+                        "state": occurrence.status.value,
+                    },
+                )
+            )
 
     def _scheduler_store_schedule(self, schedule_id: str) -> ScheduleRecord | None:
         return next(

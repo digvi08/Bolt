@@ -48,6 +48,19 @@ class ModelRouter:
         if not self.providers and self.fallback_to_deterministic:
             self.providers.append(DeterministicModelProvider())
 
+    def for_task(self) -> ModelRouter:
+        """Create an isolated budget for one task while reusing trusted providers."""
+        return ModelRouter(
+            providers=list(self.providers),
+            max_attempts=self.max_attempts,
+            fallback_to_deterministic=self.fallback_to_deterministic,
+            max_total_tokens=self.max_total_tokens,
+            max_total_cost=self.max_total_cost,
+            input_price_per_1k=self.input_price_per_1k,
+            output_price_per_1k=self.output_price_per_1k,
+            max_model_calls=self.max_model_calls,
+        )
+
     def select(self, request: ModelRequest) -> Any:
         if not self.providers:
             raise ValueError("no model providers configured")

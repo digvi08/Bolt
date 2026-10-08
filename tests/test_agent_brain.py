@@ -28,7 +28,7 @@ class StubProvider:
     descriptor = AbilityDescriptor(
         name="browser",
         description="stub browser provider",
-        supported_actions=("navigate", "observe", "fill", "submit"),
+        supported_actions=("navigate", "inspect", "observe", "fill", "submit"),
         risk_classes=("low", "medium", "high"),
         provider="browser",
     )
@@ -102,11 +102,30 @@ def test_model_router_uses_bounded_fallback():
 
 
 def test_agent_execution_loop_executes_consequential_plan_with_approval():
+    class ExplicitSubmitPlanner:
+        def plan(self, intent, *, registry=None):
+            return Plan(
+                goal=intent.goal,
+                total_risk="high",
+                steps=(
+                    PlanStep(
+                        ability="browser",
+                        action="submit",
+                        step_id="submit",
+                        arguments={"target_id": "submit", "expected_text": "submitted"},
+                        expected_result="submission confirmation is visible",
+                        verification=("submission confirmation is visible",),
+                        risk="high",
+                        requires_approval=True,
+                    ),
+                ),
+            )
+
     registry = AbilityRegistry()
     registry.register(StubProvider())
     loop = AgentExecutionLoop(
         registry,
-        planner=DeterministicAgentPlanner(),
+        planner=ExplicitSubmitPlanner(),
         interpreter=DeterministicTaskInterpreter(),
         approval_provider=StubApproval(True),
         config=AgentConfig(allowed_actions=frozenset({ActionKind.BROWSER})),
@@ -205,7 +224,7 @@ def test_agent_execution_loop_resumes_persisted_plan_without_repeating_completed
 
     assert result.success is True
     assert provider.calls.count("navigate") == 1
-    assert provider.calls.count("observe") == 2
+    assert provider.calls.count("inspect") == 1
     assert planner.calls == 1
 
 

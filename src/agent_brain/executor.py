@@ -203,11 +203,17 @@ class AgentExecutionLoop:
             self._set_task_status(task, TaskStatus.STOPPED)
             self._persist_task(task, "task.stopped")
             return AgentResult(False, task.id, intent=intent, reason="kill switch engaged", decision=decision)
-        planner = self.planner or (
-            ModelAgentPlanner(self.model_router, self.config)
-            if self.model_router is not None
-            else DeterministicAgentPlanner()
+        task_model_router = (
+            self.model_router.for_task() if self.model_router is not None else None
         )
+        if isinstance(self.planner, ModelAgentPlanner) and task_model_router is not None:
+            planner: AgentPlanner = replace(self.planner, model_router=task_model_router)
+        else:
+            planner = self.planner or (
+                ModelAgentPlanner(task_model_router, self.config)
+                if task_model_router is not None
+                else DeterministicAgentPlanner()
+            )
         if stored_task is not None and "plan" in task.execution_metadata:
             try:
                 plan = _restore_plan(task)
@@ -247,7 +253,7 @@ class AgentExecutionLoop:
         outputs: list[object] = []
         completed_actions: list[tuple[str, str, str]] = []
         tool_calls = 0
-        model_turns = 1 if self.model_router is not None else 0
+        model_turns = 1 if task_model_router is not None else 0
         validator = PlanValidator(
             self.registry,
             max_plan_steps=min(plan.budget.get("max_plan_steps", 8), self.config.max_plan_steps),
@@ -285,7 +291,7 @@ class AgentExecutionLoop:
             if step_number >= len(plan.steps):
                 if not isinstance(planner, ModelAgentPlanner):
                     break
-                if self.model_router is None or tool_calls >= self.config.max_tool_calls:
+                if task_model_router is None or tool_calls >= self.config.max_tool_calls:
                     break
                 model_turns += 1
                 if model_turns > self.config.max_replans + 1:
@@ -374,10 +380,6 @@ class AgentExecutionLoop:
                 and persisted_action.verification_status
                 in {VerificationStatus.VERIFIED, VerificationStatus.NOT_CONFIGURED}
             ):
-                if task.status is TaskStatus.FAILED:
-                    self._set_task_status(task, TaskStatus.RECOVERING)
-                if task.status is not TaskStatus.SUCCEEDED:
-                    self._set_task_status(task, TaskStatus.SUCCEEDED)
                 task.current_step = None
                 if step.step_id not in task.completed_steps:
                     task.completed_steps.append(step.step_id)
@@ -483,7 +485,7 @@ class AgentExecutionLoop:
             self._persist_task(task, "task.step_completed")
 
         final_output: object | None = outputs[-1] if outputs else None
-        if self.model_router is not None and outputs:
+        if task_model_router is not None and outputs:
             synthesis_prompt = json.dumps(
                 {
                     "user_request": user_request[:8_000],
@@ -500,7 +502,7 @@ class AgentExecutionLoop:
                 default=str,
             )
             try:
-                synthesis = self.model_router.route(
+                synthesis = task_model_router.route(
                     ModelRequest(
                         prompt=synthesis_prompt[:24_000],
                         task_type="reasoning",
@@ -637,6 +639,7 @@ class AgentExecutionLoop:
                 "expected_result": step.expected_result,
                 "verification": step.verification,
                 "risk": step.risk,
+                "reason": step.reason,
                 "requires_approval": step.requires_approval,
                 "dependencies": step.dependencies,
             }
@@ -791,18 +794,56 @@ def _to_risk(risk: str) -> RiskLevel:
 
 
 def _arguments_are_valid(action: str, arguments: dict[str, object]) -> bool:
-    required = {
-        "fetch": ("url",),
-        "search": ("query",),
-        "read_text": ("path",),
-        "list_directory": (),
-        "write_text": ("path", "text"),
-        "navigate": ("url",),
-        "fill": ("target_id", "value"),
-        "click": ("target_id",),
-        "submit": ("target_id",),
-    }.get(action, ())
-    return all(arguments.get(key) not in (None, "") for key in required)
+    schemas = {
+        "fetch": ({"url"}, {"url"}),
+        "search": ({"query"}, {"query"}),
+        "read_text": ({"path"}, {"path"}),
+        "list_directory": ({"path"}, set()),
+        "write_text": ({"path", "text"}, {"path", "text"}),
+        "navigate": ({"url", "expected_text", "expected_url"}, {"url"}),
+        "inspect": (
+            {"target", "expected_text", "expected_url", "expected_element"},
+            set(),
+        ),
+        "extract": (
+            {"target", "expected_text", "expected_url", "expected_element"},
+            set(),
+        ),
+        "fill": (
+            {"target_id", "value", "expected_text", "expected_url", "expected_element"},
+            {"target_id", "value"},
+        ),
+        "click": (
+            {"target_id", "expected_text", "expected_url", "expected_element"},
+            {"target_id"},
+        ),
+        "submit": (
+            {"target_id", "expected_text", "expected_url", "expected_element"},
+            {"target_id"},
+        ),
+        "wait": ({"seconds"}, {"seconds"}),
+    }.get(action)
+    if schemas is None:
+        return False
+    allowed, required = schemas
+    if not set(arguments).issubset(allowed) or not required.issubset(arguments):
+        return False
+    if action == "wait":
+        seconds = arguments["seconds"]
+        return (
+            isinstance(seconds, (int, float))
+            and not isinstance(seconds, bool)
+            and 0 <= seconds <= 2
+        )
+    if action in {"click", "submit"} and not any(
+        isinstance(arguments.get(key), str)
+        for key in ("expected_text", "expected_url", "expected_element")
+    ):
+        return False
+    return (
+        all(isinstance(value, str) and 0 < len(value) <= 4096 for value in arguments.values())
+        and len(json.dumps(arguments, ensure_ascii=False)) <= 8_000
+    )
 
 
 def _has_dependency_cycle(steps: tuple[PlanStep, ...]) -> bool:

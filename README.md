@@ -21,18 +21,22 @@ Run `bolt doctor` (or `bolt doctor --json`) to inspect the database, current all
 
 The CLI can enable bounded public web reads only when both `BOLT_ALLOWED_ACTIONS=network_read` and `BOLT_ENABLE_EXTERNAL_INTEGRATIONS=true` are explicitly set. Use `bolt task submit "search the web for ..."` or `bolt task submit "fetch https://example.org/"`. Search uses Bing's public RSS results for personal, non-commercial rendering. Web output is marked as untrusted data and returned separately from task authorization. Fetch follows at most four redirects, resolves and validates every destination, pins the connection to a validated public address, verifies HTTPS certificates, rejects compressed/unsupported/oversized responses, and sends no cookies, credentials, or caller-supplied headers. Ordinary HTTP is supported but reported as insecure. Search-provider availability/rate limits and Bing's usage terms apply.
 
+The restricted Playwright browser is available only when `browser` is explicitly allowlisted and external integrations are enabled. It is not general browsing: it permits public HTTPS documents on port 443 through a DNS-pinning egress proxy, disables JavaScript, frames, subresources, downloads, and persistent state, and limits form interactions. Navigation and inspection are low risk, filling is medium risk, and clicking/submitting is high risk and uses durable approval. Page content is always untrusted. See [docs/BROWSER.md](docs/BROWSER.md) for the security boundary, limitations, and setup.
+
 For bounded workspace access, set `BOLT_WORKSPACE_ROOT` to an existing directory and `BOLT_ALLOWED_ACTIONS=read_only` to list/read using `bolt task submit "list files"` or `bolt task submit "read file notes.txt"`. The ability refuses path escapes and symlinks, caps content and directory sizes, and returns file contents as untrusted document data. Creating a new file is supported only under an existing parent directory and requires the separate `write_file` permission plus current policy approval. When approval is required, the action remains pending until an operator approves or denies it with `bolt approval`; existing files are never overwritten. If the process exits during file creation, startup reconciliation compares the target with the persisted intent: exact content confirms completion, a missing target confirms no write, and any mismatch remains uncertain and blocked. SQLite and the filesystem are not atomic together. The boundary is intended for a locally controlled workspace; it does not defend against a hostile same-user process racing filesystem path changes.
 
 The local kill switch is persisted with the application database and checked on every runtime decision. Use `bolt safety kill-switch engage` to stop new actions and `bolt safety kill-switch release` to resume them; `bolt safety kill-switch status` reports the effective state. `BOLT_KILL_SWITCH_ACTIVE=true` remains an additional fail-safe override and cannot be cleared by the CLI while asserted. The control is local-only and is not exposed through the HTTP API.
 
-For model planning, set `BOLT_MODEL_BASE_URL` and `BOLT_MODEL_NAME`. Remote endpoints must use HTTPS and require `BOLT_MODEL_API_KEY`; plain HTTP is accepted only for loopback model servers. Supply the key through the process environment rather than a command-line argument. It is held in process memory and is not written to the task database. Model output is validated against registered abilities and current policy; the model cannot grant approval or choose risk, providers, credentials, or verification. Without a model configuration, deterministic planning remains available.
+For model planning, set `BOLT_MODEL_BASE_URL` and `BOLT_MODEL_NAME`. Remote endpoints must use HTTPS and require `BOLT_MODEL_API_KEY`; plain HTTP is accepted only for loopback model servers. Supply the key through the process environment rather than a command-line argument. It is held in process memory and is not written to the task database. Model output is validated against registered abilities and current policy; the model cannot grant approval or choose risk, providers, credentials, or verification. Model-call, tool-call, token, and replan budgets are bounded per task. Multi-source tasks can explicitly raise limits, for example `BOLT_MAX_REPLANS=4` and `BOLT_MAX_MODEL_CALLS=8`. Without a model configuration, deterministic planning remains available.
 
 For example, in PowerShell:
 
 ```powershell
-$env:BOLT_ALLOWED_ACTIONS = "network_read,read_only"
+$env:BOLT_ALLOWED_ACTIONS = "network_read,read_only,write_file"
 $env:BOLT_ENABLE_EXTERNAL_INTEGRATIONS = "true"
 $env:BOLT_WORKSPACE_ROOT = "C:\Users\you\project"
+$env:BOLT_MAX_REPLANS = "4"
+$env:BOLT_MAX_MODEL_CALLS = "8"
 bolt doctor
 bolt task submit "search the web for Python documentation"
 bolt task submit "read file README.md"
@@ -76,7 +80,7 @@ The model is a planner/reasoner, not the execution authority. Execution remains 
 
 ## Durable task scheduling
 
-`TaskScheduler` supports one-time (`run_at`) and fixed-interval schedules. Cron expressions are intentionally rejected until their timezone and daylight-saving semantics are explicitly supported. Construct the scheduler with the same `SQLiteTaskStore` and `AgentRuntime` used by the application; scheduled direct actions are dispatched only through `AgentRuntime.run_async`, so current policy, approval, verification, and kill-switch checks remain in force. Scheduled natural-language objectives do not yet use the model/ability pipeline; do not schedule web research or workspace reports expecting model planning.
+`TaskScheduler` supports one-time (`run_at`), fixed-interval, and restricted weekday cron schedules. Cron uses five fields with wildcard day/month and integer, range, list, or wildcard minute/hour/weekday values plus an IANA timezone; unsupported expressions fail closed. Nonexistent local daylight-saving times are skipped and a repeated local time is dispatched once. Scheduled natural-language objectives are dispatched by the scheduler through the `AgentService` task executor, then use the same `AgentExecutionLoop`, model router, ability registry, runtime policy, kill switch, credential broker, approval, verification, and audit path as manual tasks. The scheduler does not call model or ability providers directly. Each occurrence has a unique persisted task identity and caller ownership; model budgets are fresh but bounded for each task. A consequential scheduled action persists as pending approval and is never auto-approved.
 
 Call `await scheduler.run_once()` from an application-owned loop, or `await scheduler.run_forever(stop_event=...)` to poll until stopped. `max_concurrent_tasks` bounds active occurrences. Misfires beyond `misfire_grace_seconds` are recorded and skipped rather than replayed as a burst. Interval schedules skip elapsed intervals and run at most one occurrence per poll.
 
@@ -94,7 +98,7 @@ Task submission accepts an optional caller ID and idempotency key. The pair and 
 
 Typed status responses contain sanitized task/action state and verification state, not provider output, browser content, model prompts, or credentials. Audit reads are read-only and filterable; their response details use an allowlist. An uncertain action remains blocked unless `request_reconciliation` goes through the runtime's current kill-switch, policy, approval, identity-integrity, and independent-reconciler checks. Inconclusive reconciliation leaves the action uncertain. Cancellation reports a request, not successful completion; in-flight provider work is not forcibly interrupted, and uncertain work cannot be cancelled into a terminal success state.
 
-The service owns at most one scheduler polling loop. `start_scheduler()` is idempotent, `stop_scheduler()` waits for an active polling cycle and can be followed by a restart, and `shutdown()` performs final scheduler closure. Cron remains an explicit unsupported-capability error. Typed service errors distinguish invalid requests, missing records, policy/approval/kill-switch blocks, conflicts, uncertainty, cancellation errors, unsupported scheduling capabilities, and internal failures. No authentication or remote transport is provided; a future network adapter must add its own caller authentication and authorization.
+The service owns at most one scheduler polling loop. `start_scheduler()` is idempotent, `stop_scheduler()` waits for an active polling cycle and can be followed by a restart, and `shutdown()` performs final scheduler closure. Objective schedules support bounded run-at, interval, and restricted weekday cron expressions; unsupported cron syntax fails closed. Typed service errors distinguish invalid requests, missing records, policy/approval/kill-switch blocks, conflicts, uncertainty, cancellation errors, unsupported capabilities, and internal failures. No authentication or remote transport is provided; a future network adapter must add its own caller authentication and authorization.
 
 ## Local provider credentials
 
@@ -140,7 +144,8 @@ bolt action reconcile <execution-id>
 bolt approval list
 bolt approval show <approval-id>
 bolt approval approve <approval-id>
-bolt schedule create --objective "Inspect status" --action-name browser.observe --action-kind read_only --run-at 2030-01-02T03:04:05Z --parameters-json '{"url":"https://example.invalid"}'
+bolt schedule create --execution-mode objective --objective "Research official Python release news, summarize sources, and save a report" --run-at 2030-01-07T08:00:00Z --type cron --cron-expression "0 8 * * 1-5" --timezone-policy UTC
+bolt scheduler start
 bolt scheduler status
 bolt audit list --task-id <task-uuid> --limit 50 --json
 bolt safety status --json

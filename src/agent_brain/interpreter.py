@@ -27,7 +27,13 @@ class DeterministicTaskInterpreter(TaskInterpreter):
         possible_consequential_actions: list[str] = []
         constraints: list[str] = []
 
-        if any(token in lower for token in ("submit", "confirm", "send", "purchase", "book", "pay", "place order")):
+        if "browser" in lower and any(
+            token in lower for token in ("https://", "http://", "navigate", "visit", "open", "inspect")
+        ):
+            goal = TaskGoal.NAVIGATE if any(token in lower for token in ("navigate", "visit", "open")) else TaskGoal.FIND_INFORMATION
+            ability = "browser"
+            risk = "read"
+        elif any(token in lower for token in ("submit", "confirm", "send", "purchase", "book", "pay", "place order")):
             goal = TaskGoal.SUBMIT_FORM
             ability = "browser"
             risk = "high"

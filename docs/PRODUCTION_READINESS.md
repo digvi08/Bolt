@@ -2,7 +2,7 @@
 
 ## Verdict
 
-**BLOCKED — this project provides a useful, bounded local agent foundation, but it is not a complete general-purpose computer-use agent.** The safe built-in capability set is intentionally narrow: optional public web search/fetch and rooted workspace read/create-only-write operations. Browser interaction, authenticated services, desktop control, terminal execution, and automatic verification of external effects are not enabled.
+**PRODUCTION-READY FOR LOCAL PERSONAL USE** — when configured with the documented local controls and only the required allowlisted capabilities. This is not a general-purpose computer-use agent: browser interaction is deliberately limited to public HTTPS documents and consequential actions require durable operator approval. Review the exact limitations below and configure only the capabilities you need before enabling them.
 
 Do not interpret a passing test suite as evidence that unsupported integrations are safe or production-ready.
 
@@ -17,6 +17,8 @@ Do not interpret a passing test suite as evidence that unsupported integrations 
 - A persistent local kill switch with CLI engage/release/status commands and an additional environment fail-safe override.
 - Durable SQLite-backed action approvals with expiration and action fingerprinting. The CLI and authenticated API let an operator list, inspect, approve, or deny a pending action; approval resumes the waiting task through the execution loop. The application creates this provider by default, and embedding applications may inject another approval provider.
 - Windows Credential Manager integration for scoped provider credentials where the OS binding is available. Provider credential metadata is kept separately from values.
+- A restricted Playwright browser ability routed through the same service, execution loop, registry/router, runtime policy, durable approval, verification, and audit path as other abilities. Its DNS-pinned egress proxy, request filtering, and disabled JavaScript/subresources enforce a deliberately narrow public-document subset.
+- Persistent natural-language scheduled objectives dispatched through `AgentService` into the same bounded model/ability execution pipeline as manual tasks. Schedule occurrences retain caller ownership and unique identities; consequential work waits for operator approval and is not auto-approved.
 
 ## CURRENT CAPABILITIES
 
@@ -33,7 +35,7 @@ CLI/API -> AgentService -> AgentExecutionLoop -> AbilityRouter
        -> optional bounded model synthesis
 ```
 
-The model does not call a provider directly. Each action has to be supported by the currently registered ability, pass its fixed argument schema, and pass the runtime's current policy. The API is a request boundary, not a provider boundary.
+The model does not call a provider directly. Each action has to be supported by the currently registered ability, pass its fixed argument schema, and pass the runtime's current policy. The scheduler dispatches an objective through `AgentService`; it does not call model or ability providers. The API is a request boundary, not a provider boundary.
 
 ## MODEL
 
@@ -45,7 +47,7 @@ Web search and fetch require both `network_read` in `BOLT_ALLOWED_ACTIONS` and `
 
 ## BROWSER
 
-**Browser execution is disabled and not registered.** The repository has Playwright adapter code, but it does not yet provide enforceable DNS-pinned navigation and continuous redirect/subresource controls suitable for arbitrary pages. `bolt doctor` reports it as `unsupported_not_registered`. No model or user request can route to Playwright through the application. Do not treat the existing browser unit tests as proof that production browser navigation is safe.
+Browser execution is registered only when `browser` is explicitly allowlisted and external integrations are enabled. The usable subset supports bounded HTTPS document navigation on port 443, inspection/extraction, accessible-target click, non-sensitive field fill, bounded wait, and explicitly permitted form submission. JavaScript, frames, subresources, downloads/uploads, cookies, credentials, persistent profiles, and authenticated sessions are unavailable. Outbound browser TCP uses a local SOCKS5 proxy that resolves, rejects non-public addresses, and connects to the validated IP; requests and redirects are filtered, with all non-document traffic denied. Page data is always untrusted. Clicks and submissions use the existing durable approval workflow. See [BROWSER.md](BROWSER.md) for the enforcement boundary and limitations. This is not safe general browsing and does not defend against a compromised browser/runtime or malicious same-user process.
 
 ## WORKSPACE
 
@@ -65,21 +67,21 @@ Interrupted in-flight actions become uncertain and are not automatically replaye
 
 ## SCHEDULING
 
-The existing scheduler persists schedules and occurrences, bounds concurrency, enforces deadlines and kill-switch checks, and recovers interrupted occurrences conservatively. Its current application composition dispatches direct `ActionRequest` values through the runtime, not natural-language objectives through `AgentExecutionLoop`; built-in web/workspace model workflows are therefore **not yet available as scheduled jobs**. Do not create a schedule expecting model planning or a web report until that execution-path gap is implemented.
+The scheduler persists caller-owned objective schedules and occurrences, bounds concurrency, enforces deadlines and kill-switch checks, and recovers interrupted occurrences conservatively. It dispatches each objective through `AgentService` into the same `AgentExecutionLoop` used by manual tasks; model planning, ability validation, runtime policy, credential broker, kill switch, approval, verification, audit, and persistence are shared. Model/tool limits are fresh but bounded per occurrence. A high-risk action creates durable pending approval and is never automatically approved. Recovery avoids duplicate occurrence identities and does not replay interrupted external actions as if their outcome were known. Cron is intentionally restricted to five fields with wildcard day/month and integer/range/list/wildcard minute/hour/weekday values.
 
 ## SECURITY
 
-The model is a proposer only. External web and workspace text is untrusted. The runtime rechecks policy and kill switch immediately before provider execution, including after approval; unknown or unsupported abilities fail closed. Credentials remain broker-scoped and are not available to the model. Browser, shell, desktop, unrestricted filesystem, authenticated browsing, and remote kill-switch control are disabled. The local database is not encrypted or tamper-proof against malicious code executing as the same OS user.
+The model is a proposer only. External web, workspace, and browser content is untrusted. The runtime rechecks policy and kill switch immediately before provider execution, including after approval; unknown or unsupported abilities fail closed. Credentials remain broker-scoped and are not available to the model. Shell, desktop, unrestricted filesystem, authenticated browsing, and remote kill-switch control are disabled. The local database is not encrypted or tamper-proof against malicious code executing as the same OS user.
 
 ## TESTS
 
-Run `python -m pytest --collect-only -q`, `python -m pytest -q`, `ruff check src tests`, `mypy src`, and `git diff --check`. Current validation collected 270 tests and completed with **269 passed, 1 skipped**; Ruff, mypy, and the diff check passed. Tests do not certify unsupported browser or scheduled-model workflows, nor replace production deployment and provider validation.
+For this revision, `python -m pytest --collect-only -q` collected 296 tests and `python -m pytest -q` completed with **295 passed, 1 skipped**. `ruff check src tests`, `mypy src`, and `git diff --check` pass. Deterministic tests cover the restricted browser route, approval and verification boundary, malicious page instructions, forbidden destinations, redirects, kill-switch behavior, browser restart uncertainty, manual research/save, scheduled research/save, durable approval, restarts, and duplicate occurrence prevention. They do not replace deployment review or live provider configuration.
 
 ## LIMITATIONS
 
-- Browser functionality is intentionally unavailable pending a defensible network-isolation implementation and end-to-end tests.
+- Browser support is a restricted public-document subset; modern JavaScript-dependent sites, authenticated sessions, persistent profiles, subresources, uploads, and downloads are unsupported.
 - Multi-person approval quorum and distributed approval/execution workers are not implemented; the durable workflow is scoped to the single local application owner.
-- Model-driven scheduled research/report jobs do not use the model ability loop.
+- Browser remote side effects cannot be independently reconciled after process failure; the action remains uncertain and is not replayed automatically.
 - No live model endpoint or production verification provider is configured by default.
 - Exactly-once external execution cannot be guaranteed by local SQLite.
 - OS permissions, database backup, monitoring, and secure model-provider deployment require operator configuration.
@@ -93,11 +95,13 @@ py -m pip install -e .
 $env:BOLT_ALLOWED_ACTIONS = "network_read,read_only"
 $env:BOLT_ENABLE_EXTERNAL_INTEGRATIONS = "true"
 $env:BOLT_WORKSPACE_ROOT = "C:\Users\you\project"
+$env:BOLT_MAX_REPLANS = "4"
+$env:BOLT_MAX_MODEL_CALLS = "8"
 bolt doctor
 bolt safety kill-switch status
 ```
 
-Add `$env:BOLT_MODEL_BASE_URL`, `$env:BOLT_MODEL_NAME`, and (for remote HTTPS providers) `$env:BOLT_MODEL_API_KEY` to opt into model planning. Do not put the key in command arguments or task text. Review outstanding actions with `bolt approval list`; use `bolt approval show`, `approve`, or `deny` with the approval ID to make a decision. The default database is under the current user's local application-data directory; `--database <path>` overrides it per command.
+Add `write_file` when reports should be saved. Add `browser` to `BOLT_ALLOWED_ACTIONS` and install Chromium only when browser actions are needed. Configure `$env:BOLT_MODEL_BASE_URL`, `$env:BOLT_MODEL_NAME`, and (for remote HTTPS providers) `$env:BOLT_MODEL_API_KEY` to opt into model planning; the task loop remains unavailable for model planning until a provider is configured. Do not put the model key in command arguments or task text. Review outstanding actions with `bolt approval list`; use `bolt approval show`, `approve`, or `deny` with the approval ID to make a decision. The default database is under the current user's local application-data directory; `--database <path>` overrides it per command.
 
 ## EXAMPLES
 
@@ -109,6 +113,9 @@ bolt task submit "fetch https://docs.python.org/3/whatsnew/3.13.html"
 bolt task submit "list files"
 bolt task submit "read file README.md"
 bolt task submit "create file research-notes.txt with key findings"
+bolt task submit "Open https://example.com, inspect the page, and summarize its visible content."
+bolt schedule create --execution-mode objective --objective "Research official Python release news, summarize sources, and save a report" --run-at 2030-01-07T08:00:00Z --type cron --cron-expression "0 8 * * 1-5" --timezone-policy UTC
+bolt scheduler start
 bolt approval list
 bolt approval show <approval-id>
 bolt approval approve <approval-id>
@@ -117,21 +124,21 @@ bolt safety kill-switch engage
 bolt safety kill-switch release
 ```
 
-The file-creation example may leave a pending approval for the operator to review and decide using the approval commands. The final two examples are local operator controls. Browser actions and scheduled model-research workflows are not examples because those features are not currently supported.
+The file-creation and browser examples may leave pending approvals for the operator to review and decide using the approval commands. The cron example is a weekday objective schedule; configure its model, web, and workspace permissions explicitly. The final two examples are local operator controls.
 
 ## What is deliberately unsupported
 
-- **Browser execution:** Playwright code exists as an adapter, but it is not registered as a normal application ability. Its current navigation path does not provide the complete destination pinning and subresource policy required for safe model-directed browsing. Do not expose it to model plans or use it against arbitrary sites.
+- **General-purpose browser execution:** authenticated sessions, JavaScript-dependent sites, arbitrary subresources, persistent browser state, upload/download, and browser recovery after interrupted side effects are unsupported. The restricted browser subset described above is the only registered route.
 - **Authenticated browser sessions:** login, cookie/profile persistence, and automatic credential injection are unsupported.
 - **Desktop, terminal, administrator, arbitrary filesystem, and destructive actions:** these are not built-in execution capabilities.
-- **Reliable verification by default:** no production verification provider is configured. A provider's successful return or a local journal flag is not independent evidence of an external effect.
+- **Independent verification of arbitrary external effects:** built-in providers verify bounded observable postconditions (browser page state, workspace state, and web response properties), but they cannot independently establish every remote side effect such as a purchase, message delivery, or account change.
 - **Provider-specific browser reconciliation:** the application cannot infer a remote side effect from a page still being open. Browser actions interrupted during execution remain uncertain and blocked.
 - **Multi-person or distributed approvals:** the approval record is durable, but the application does not implement quorum decisions or distributed execution/approval workers.
 - **Distributed execution:** SQLite and the process lock support one local application owner, not multi-host workers or distributed leases.
 
 ## Operating guidance
 
-1. Install the package and Playwright Chromium only if needed for local browser-layer tests; do not treat installing a browser as enabling a safe browser ability.
+1. Install the package. To use the restricted browser ability, install Playwright Chromium with `py -m playwright install chromium`; browser use is still gated by explicit configuration.
 2. Use the documented per-user SQLite location or an explicit protected local path. Back up the database using an application-consistent procedure. Do not use network filesystems or multiple application processes against one database.
 3. Enable only required action kinds. Public network reads require both `network_read` allowlisting and `BOLT_ENABLE_EXTERNAL_INTEGRATIONS=true`; workspace writes additionally need the configured root and `write_file`.
 4. Configure a model endpoint only when needed. Use HTTPS for remote endpoints and inject the API key through a protected process environment. Never place credentials in task prompts or model output.
@@ -143,10 +150,8 @@ The file-creation example may leave a pending approval for the operator to revie
 
 | Gap | Classification | Consequence |
 |---|---|---|
-| Browser route/subresource enforcement and a registered, safe browser capability | Implementation work still needed | Browser ability remains unavailable; enabling the existing raw Playwright navigation path would be unsafe. |
-| Browser-specific independent verification/reconciliation | Provider capability limitation and implementation work still needed | Interrupted browser side effects cannot be safely resolved automatically and remain blocked. |
+| General-purpose browser support and browser reconciliation after restart | Out of scope/provider capability limitation | Only the restricted public-document subset is enabled; interrupted browser side effects remain uncertain and are not automatically replayed. |
 | Atomicity across an external provider side effect and SQLite journal commit | Fundamentally impossible to guarantee with a local transaction | A crash can always leave an uncertain outcome; provider idempotency or independent reconciliation is needed to resolve it. |
-| Natural-language scheduler dispatch through the model/ability loop | Implementation work still needed | Current scheduler stores and dispatches direct runtime actions; do not expect it to run model-planned research tasks. |
 | Production verification adapters for actual external effects | Provider capability limitation and deployment/configuration work | Completion is not independently verified unless the application injects a trustworthy verifier. |
 | OS-backed credential backend outside supported Windows configuration | Deployment/configuration work | Credential-value operations fail closed on unsupported platforms. |
 | Hardened service installation, backup, OS permissions, monitoring, and model endpoint configuration | Deployment/configuration work | Operators must supply and maintain host-level controls; the repository does not set them up automatically. |

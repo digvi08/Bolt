@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from abilities.models import AbilityAction, AbilityContext, AbilityDescriptor, AbilityResult
 from abilities.registry import AbilityRegistry
 from agent_brain.executor import AgentExecutionLoop
+from agent_brain.model_router import ModelRouter
 from agent_core.api import create_api_app
 from agent_core.api_auth import (
     ApiCredentialStore,
@@ -221,7 +222,7 @@ class Provider:
     descriptor = AbilityDescriptor(
         name="browser",
         description="API integration test provider",
-        supported_actions=("navigate", "observe", "fill", "submit"),
+        supported_actions=("navigate", "inspect", "observe", "fill", "submit"),
         risk_classes=("low", "medium", "high"),
         provider="test",
     )
@@ -232,6 +233,11 @@ class Provider:
 
     def supports(self, action: str) -> bool:
         return action in self.descriptor.supported_actions
+
+    def risk_for(self, action: str):
+        from agent_core.models import RiskLevel
+
+        return RiskLevel.HIGH if action in {"click", "submit"} else RiskLevel.LOW
 
     def execute(
         self, action: AbilityAction, _context: AbilityContext | None = None
@@ -259,6 +265,29 @@ class Approval:
         return True
 
 
+class SubmitPlanModel:
+    name = "api-test"
+    model_name = "api-test"
+    capabilities = ("structured", "text")
+
+    def structured_generate(self, _prompt, _schema, *, system=None):
+        return {
+            "steps": [
+                {
+                    "ability": "browser",
+                    "action": "submit",
+                    "arguments": {
+                        "target_id": "submit-button",
+                        "expected_text": "Order submitted",
+                    },
+                }
+            ]
+        }
+
+    def generate(self, _prompt, *, system=None, max_tokens=None):
+        return "done"
+
+
 class AsyncProvider:
     async def execute_async(self, _action: ActionRequest) -> object:
         return {"ok": True}
@@ -282,6 +311,7 @@ def build_runtime_service(
     kill_switch: Switch | None = None,
     provider: Provider | None = None,
     reconciler: Reconciler | None = None,
+    model_router: ModelRouter | None = None,
 ):
     store = SQLiteTaskStore(database_path)
     config = AgentConfig(allowed_actions=allowed_actions)
@@ -295,6 +325,7 @@ def build_runtime_service(
         kill_switch=switch,
         config=config,
         state_store=store,
+        model_router=model_router,
     )
     runtime = AgentRuntime(
         config,
@@ -380,11 +411,21 @@ def test_runtime_policy_approval_and_kill_switch_remain_authoritative(tmp_path):
         ),
     )
     for name, allowed, approval, switch, objective, status, code in scenarios:
+        model_router = (
+            ModelRouter(
+                providers=[SubmitPlanModel()],
+                fallback_to_deterministic=False,
+                max_model_calls=1,
+            )
+            if name == "approval"
+            else None
+        )
         service, state_store, provider = build_runtime_service(
             tmp_path / f"{name}.sqlite3",
             allowed_actions=allowed,
             approval_provider=approval,
             kill_switch=switch,
+            model_router=model_router,
         )
         credentials = ApiCredentialStore(tmp_path / f"{name}-credentials.json")
         credential = credentials.create({ApiScope.TASK_SUBMIT})

@@ -15,7 +15,7 @@ from agent_core.models import ActionKind, VerificationResult
 
 class BrowserProvider:
     ability = "browser"
-    descriptor = AbilityDescriptor(name="browser", supported_actions=("navigate", "observe", "fill", "submit"))
+    descriptor = AbilityDescriptor(name="browser", supported_actions=("navigate", "inspect", "observe", "fill", "submit"))
 
     def __init__(self, mode="transient", failures=99):
         self.mode = mode
@@ -101,12 +101,37 @@ def test_verification_uncertainty_is_not_retried():
 
 
 def test_approval_denial_is_not_retried():
+    from agent_brain.models import Plan, PlanStep
+
+    class ExplicitSubmitPlanner:
+        def plan(self, intent, *, registry=None):
+            return Plan(
+                goal=intent.goal,
+                total_risk="high",
+                steps=(
+                    PlanStep(
+                        ability="browser",
+                        action="submit",
+                        step_id="submit",
+                        arguments={"target_id": "submit", "expected_text": "submitted"},
+                        expected_result="submission confirmation is visible",
+                        verification=("submission confirmation is visible",),
+                        risk="high",
+                        requires_approval=True,
+                    ),
+                ),
+            )
+
     provider = BrowserProvider(mode="success")
     approval = Approval(False)
-    result = make_loop(provider, approval_provider=approval).run("Fill the form and submit it.")
+    result = make_loop(
+        provider,
+        approval_provider=approval,
+        planner=ExplicitSubmitPlanner(),
+    ).run("Fill the form and submit it.")
     assert not result.success
     assert approval.calls == 1
-    assert provider.calls == 2
+    assert provider.calls == 0
 
 
 def test_replan_budget_is_cumulative_and_bounded():

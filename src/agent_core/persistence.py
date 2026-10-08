@@ -15,6 +15,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, ClassVar, Concatenate, ParamSpec, Protocol, TypeVar
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .credential_broker import (
     AbilityId,
@@ -90,6 +91,7 @@ class OccurrenceStatus(StrEnum):
     DUE = "due"
     DISPATCHING = "dispatching"
     RUNNING = "running"
+    AWAITING_APPROVAL = "awaiting_approval"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -142,6 +144,9 @@ class ScheduleRecord:
     status: ScheduleStatus = ScheduleStatus.SCHEDULED
     occurrence_number: int = 0
     timezone_policy: str = "UTC"
+    execution_mode: str = "action"
+    caller_id: str = "local"
+    cron_expression: str | None = None
     created_at: datetime = field(default_factory=_utc_now)
     updated_at: datetime = field(default_factory=_utc_now)
 
@@ -683,6 +688,7 @@ class SQLiteTaskStore:
                 status TEXT NOT NULL,
                 occurrence_number INTEGER NOT NULL,
                 timezone_policy TEXT NOT NULL,
+                cron_expression TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -707,6 +713,22 @@ class SQLiteTaskStore:
             )
             """
         )
+        schedule_columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(schedule_records)").fetchall()
+        }
+        if "execution_mode" not in schedule_columns:
+            self._connection.execute(
+                "ALTER TABLE schedule_records ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'action'"
+            )
+        if "caller_id" not in schedule_columns:
+            self._connection.execute(
+                "ALTER TABLE schedule_records ADD COLUMN caller_id TEXT NOT NULL DEFAULT 'local'"
+            )
+        if "cron_expression" not in schedule_columns:
+            self._connection.execute(
+                "ALTER TABLE schedule_records ADD COLUMN cron_expression TEXT"
+            )
         self._connection.execute(
             """
             CREATE TABLE IF NOT EXISTS idempotency_records (
@@ -1474,12 +1496,18 @@ class SQLiteTaskStore:
 
     @_synchronized
     def save_schedule(self, schedule: ScheduleRecord) -> ScheduleRecord:
-        if schedule.schedule_type is ScheduleType.CRON:
-            raise ValueError("cron schedules are not supported")
         if schedule.schedule_type is ScheduleType.INTERVAL and (
             schedule.interval_seconds is None or schedule.interval_seconds < 1
         ):
             raise ValueError("interval schedules require a positive interval")
+        if schedule.schedule_type is ScheduleType.CRON:
+            if schedule.interval_seconds is not None or not schedule.cron_expression:
+                raise ValueError("cron schedules require a supported expression")
+            _parse_weekday_cron(schedule.cron_expression)
+            try:
+                ZoneInfo(schedule.timezone_policy)
+            except ZoneInfoNotFoundError:
+                raise ValueError("unknown schedule timezone") from None
         if schedule.next_run_at.tzinfo is None:
             raise ValueError("schedule timestamps must be timezone-aware")
         if schedule.end_at is not None and schedule.end_at.tzinfo is None:
@@ -1522,8 +1550,9 @@ class SQLiteTaskStore:
                     schedule_id, task_id, objective, action_name, action_kind, parameters,
                     schedule_type, next_run_at, interval_seconds, end_at, deadline_at,
                     execution_timeout_seconds, enabled, status, occurrence_number,
-                    timezone_policy, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timezone_policy, execution_mode, caller_id, cron_expression,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(schedule_id) DO UPDATE SET
                     task_id=excluded.task_id, objective=excluded.objective,
                     action_name=excluded.action_name, action_kind=excluded.action_kind,
@@ -1533,7 +1562,10 @@ class SQLiteTaskStore:
                     execution_timeout_seconds=excluded.execution_timeout_seconds,
                     enabled=excluded.enabled, status=excluded.status,
                     occurrence_number=excluded.occurrence_number,
-                    timezone_policy=excluded.timezone_policy, updated_at=excluded.updated_at
+                    timezone_policy=excluded.timezone_policy,
+                    execution_mode=excluded.execution_mode,
+                    caller_id=excluded.caller_id, cron_expression=excluded.cron_expression,
+                    updated_at=excluded.updated_at
                 """,
                 (
                     schedule.schedule_id,
@@ -1552,6 +1584,9 @@ class SQLiteTaskStore:
                     schedule.status.value,
                     schedule.occurrence_number,
                     schedule.timezone_policy,
+                    schedule.execution_mode,
+                    schedule.caller_id,
+                    schedule.cron_expression,
                     schedule.created_at.isoformat(),
                     schedule.updated_at.isoformat(),
                 ),
@@ -1596,6 +1631,9 @@ class SQLiteTaskStore:
             status=ScheduleStatus(row["status"]),
             occurrence_number=int(row["occurrence_number"]),
             timezone_policy=row["timezone_policy"],
+            execution_mode=row["execution_mode"],
+            caller_id=row["caller_id"],
+            cron_expression=row["cron_expression"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
         )
@@ -1641,7 +1679,7 @@ class SQLiteTaskStore:
             occurrence = ScheduleOccurrence(
                 schedule_id=schedule.schedule_id,
                 occurrence_id=occurrence_id,
-                task_id=schedule.task_id,
+                task_id=uuid4() if schedule.execution_mode == "objective" else schedule.task_id,
                 execution_id=execution_id,
                 scheduled_for=scheduled_for,
                 status=status,
@@ -1676,6 +1714,16 @@ class SQLiteTaskStore:
             elif schedule.interval_seconds is not None:
                 steps = max(1, skipped_intervals + 1)
                 schedule.next_run_at += timedelta(seconds=schedule.interval_seconds * steps)
+                if schedule.end_at is not None and schedule.next_run_at > schedule.end_at:
+                    schedule.enabled = False
+                    schedule.status = ScheduleStatus.COMPLETED
+            elif schedule.schedule_type is ScheduleType.CRON:
+                assert schedule.cron_expression is not None
+                schedule.next_run_at = next_weekday_cron_time(
+                    scheduled_for,
+                    schedule.cron_expression,
+                    schedule.timezone_policy,
+                )
                 if schedule.end_at is not None and schedule.next_run_at > schedule.end_at:
                     schedule.enabled = False
                     schedule.status = ScheduleStatus.COMPLETED
@@ -1759,6 +1807,13 @@ class SQLiteTaskStore:
                 OccurrenceStatus.CANCELLED,
             },
             OccurrenceStatus.RUNNING: {
+                OccurrenceStatus.AWAITING_APPROVAL,
+                OccurrenceStatus.COMPLETED,
+                OccurrenceStatus.FAILED,
+                OccurrenceStatus.CANCELLED,
+                OccurrenceStatus.UNCERTAIN,
+            },
+            OccurrenceStatus.AWAITING_APPROVAL: {
                 OccurrenceStatus.COMPLETED,
                 OccurrenceStatus.FAILED,
                 OccurrenceStatus.CANCELLED,
@@ -2203,6 +2258,65 @@ class SQLiteTaskStore:
         self._connection.close()
 
 
+def _parse_weekday_cron(expression: str) -> tuple[set[int], set[int], set[int]]:
+    fields = expression.split()
+    if len(fields) != 5 or fields[2:4] != ["*", "*"]:
+        raise ValueError("cron supports minute, hour, wildcard day/month, and weekday only")
+
+    def values(field_value: str, minimum: int, maximum: int) -> set[int]:
+        if field_value == "*":
+            return set(range(minimum, maximum + 1))
+        result: set[int] = set()
+        for item in field_value.split(","):
+            start_text, separator, end_text = item.partition("-")
+            try:
+                start = int(start_text)
+                end = int(end_text) if separator else start
+            except ValueError:
+                raise ValueError("cron fields must use integers, ranges, or wildcards") from None
+            if start < minimum or end > maximum or start > end:
+                raise ValueError("cron field value is outside its supported range")
+            result.update(range(start, end + 1))
+        if not result:
+            raise ValueError("cron field cannot be empty")
+        return result
+
+    minutes = values(fields[0], 0, 59)
+    hours = values(fields[1], 0, 23)
+    cron_weekdays = values(fields[4], 0, 7)
+    weekdays = {6 if day in {0, 7} else day - 1 for day in cron_weekdays}
+    return minutes, hours, weekdays
+
+
+def next_weekday_cron_time(
+    after: datetime, expression: str, timezone_name: str
+) -> datetime:
+    if after.tzinfo is None:
+        raise ValueError("cron calculation requires an aware timestamp")
+    minutes, hours, weekdays = _parse_weekday_cron(expression)
+    try:
+        zone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        raise ValueError("unknown schedule timezone") from None
+    after_utc = after.astimezone(UTC)
+    first_date = after.astimezone(zone).date()
+    from datetime import time
+
+    for day_offset in range(367):
+        local_date = first_date + timedelta(days=day_offset)
+        if local_date.weekday() not in weekdays:
+            continue
+        for hour in sorted(hours):
+            for minute in sorted(minutes):
+                local_candidate = datetime.combine(local_date, time(hour, minute), tzinfo=zone)
+                candidate = local_candidate.astimezone(UTC)
+                if candidate.astimezone(zone).replace(tzinfo=None) != local_candidate.replace(tzinfo=None):
+                    continue
+                if candidate > after_utc:
+                    return candidate
+    raise ValueError("cron expression has no next run within one year")
+
+
 __all__ = [
     "ActionExecutionConflict",
     "ActionExecutionRecord",
@@ -2222,4 +2336,5 @@ __all__ = [
     "TaskStateMachine",
     "TaskStateStore",
     "TaskTransitionError",
+    "next_weekday_cron_time",
 ]

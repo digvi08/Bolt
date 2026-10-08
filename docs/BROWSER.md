@@ -1,71 +1,73 @@
-# Browser Control Layer
+# Restricted Browser
 
-> **Application availability:** Browser abilities are not registered in the default `AgentApplication`. The Playwright adapter and `BrowserTaskRunner` are not an approved general-purpose browsing surface. Playwright navigation does not yet enforce DNS-pinned destinations and network restrictions for every redirect and subresource; do not expose it to model plans or arbitrary websites. `bolt doctor` reports the browser status as `unsupported_not_registered`.
-
-## Trust and execution flow
+Browser actions are registered only when both `browser` is explicitly allowlisted and external integrations are enabled. They are routed through the same `AgentService` → `AgentExecutionLoop` → `AbilityRouter` → `AgentRuntime` path as other actions; no task runner or model has a direct Playwright execution path.
 
 ```text
-Trusted Task
-  -> AgentRuntime policy / kill switch / approval
-  -> BrowserActionProvider (typed action registry)
-  -> PlaywrightBrowserProvider
-  -> DOM and accessibility observation
-  -> browser verification
-  -> audit and bounded recovery
+user/model proposal
+  -> typed, schema-checked browser action
+  -> AgentService / AgentExecutionLoop
+  -> AbilityRegistry / AbilityRouter
+  -> AgentRuntime policy, kill switch, durable approval, audit
+  -> BrowserAbilityProvider
+  -> restricted Playwright provider and pinned egress proxy
+  -> typed state verification and persisted action outcome
 ```
 
-The forbidden flow is `LLM -> unrestricted Playwright`. The runtime owns the final execution gate. Browser actions are registered as project-owned `BrowserAction` values and converted to policy requests; Playwright page, context, locator, and browser objects never leave the adapter.
+## Supported subset
 
-## Deterministic-first strategy
+The registered operations are `navigate`, `inspect`, `extract`, `click`, `fill`, `wait`, and `submit`. There is no arbitrary JavaScript, shell, cookie or credential access, file upload, download, unrestricted file access, persistent browser profile, or authenticated login. Playwright runs headless with JavaScript, service workers, downloads, frames, and non-document network requests disabled. Only a bounded HTTPS document navigation and a specifically authorized form submission can leave the browser context.
 
-The initial backend is Playwright and observations prefer visible DOM/accessibility data. Screenshots are explicit observation values for verification or future visual reasoning, not the default model input. Future `BrowserUseProvider`, `MidsceneProvider`, and `VisualCUAProvider` implementations can satisfy the same provider boundary without changing the task manager, policy, audit, or runtime.
+Observations are capped at 20,000 characters and 200 elements. Waits are bounded to two seconds; page operations have a timeout. Form filling rejects password, file, hidden, and fields whose labels suggest passwords, secrets, one-time codes, or tokens. Form submission is limited to GET/POST and is authorized for one request to the observed form destination. `click` and `submit` are high risk and require the existing durable operator approval; `fill` is medium risk under the default approval policy.
 
-## Trust boundary
+## Network boundary
 
-Every page-derived string is wrapped as `UntrustedContent` and tagged with `untrusted_web`. Page text, hidden attributes, metadata, accessibility names, redirects, and tool output cannot become trusted instructions. Prompt-injection text is data and cannot change policy decisions.
+The browser does not rely on checking only its starting URL:
 
-## Planner/executor separation
+- URL validation permits HTTPS on port 443 only and rejects credentials in URLs and literal non-public IP addresses.
+- Every browser request is intercepted. Only main-frame HTTPS documents to the validated current host are permitted; subresources, frames, and other requests fail closed.
+- Browser TCP egress uses a local SOCKS5 proxy. The proxy resolves the requested host itself, rejects non-global addresses (including loopback, private, link-local, mapped, and special addresses), and connects to the validated IP rather than resolving it again at connect time.
+- The proxy permits port 443 only and bounds concurrent connections, bytes per connection, idle time, and tunnel lifetime. Redirects are new intercepted document requests and must independently pass the same checks.
+- Chromium is configured to use the proxy without its loopback bypass, with non-proxied WebRTC UDP and QUIC disabled.
 
-The planner produces typed `BrowserAction` objects and a `BrowserPlan`, but never calls Playwright directly. The execution boundary remains `BrowserAction -> BrowserActionProvider -> AgentRuntime -> Policy -> Approval -> PlaywrightBrowserProvider`. A future `BrowserPlanner` implementation may be model-backed, but the trusted runtime remains the final authority.
+This is a deliberately narrow public-document browser, not a general-purpose browser or a substitute for a host firewall. It cannot prove safety against a compromised browser/runtime or malicious same-user process, and it does not provide an independent reconciliation source for remote side effects. On a crash, an interrupted browser action remains uncertain and is not replayed automatically.
 
-## Action lifecycle
+## Trust, authority, and verification
 
-Each action may declare preconditions and verification. Planning is deterministic and auditable; before execution the runtime observes the page, validates preconditions, checks policy, requests approval for consequential actions, executes the action, and then verifies the resulting state. If a page no longer matches the expectation, execution stops and the system re-observes or aborts.
+All page text, titles, URLs, labels, attributes, and extracted content are `UNTRUSTED_WEB`. Page content is supplied to the planner only as untrusted tool output. It cannot modify risk or policy, approve actions, disable the kill switch, access credentials, or call another provider. A proposed click or submission still passes trusted registry validation and runtime policy; high-risk interactions stop for durable approval.
 
-## Preconditions and stale-page protection
+Verification examines typed observations rather than treating a successful Playwright call as task completion. It can check the requested and landed HTTPS destination, expected page text or element, the observed non-sensitive form value, and the state after a click or submission. Click and submit plans must specify an observable expected outcome. A mismatch or missing observation fails verification; an interrupted external side effect remains uncertain.
 
-`BrowserPrecondition` captures expected role, name, label, URL domain, text, or type. If the page changes unexpectedly, the runtime treats the state as mismatched instead of clicking a possibly wrong element. Recovery is bounded and every invalidation is auditable.
+## Setup and example
 
-## Verification
+Install Chromium once, configure a model provider for model-directed form interaction, and explicitly enable the restricted browser:
 
-Typed verification specs such as `ExpectedURL`, `ExpectedText`, `ExpectedElement`, `ExpectedElementAbsent`, `ExpectedFormValue`, and `ExpectedDownload` allow deterministic confirmation. Consequential actions require state-level verification; a successful Playwright click alone is not a successful task.
+```powershell
+py -m pip install -e .
+py -m playwright install chromium
+$env:BOLT_ALLOWED_ACTIONS = "browser"
+$env:BOLT_ENABLE_EXTERNAL_INTEGRATIONS = "true"
+$env:BOLT_MODEL_BASE_URL = "https://model.example/v1"
+$env:BOLT_MODEL_NAME = "your-model"
+$env:BOLT_MODEL_API_KEY = "<provide through a protected environment>"
+$env:BOLT_MAX_REPLANS = "4"
+$env:BOLT_MAX_MODEL_CALLS = "8"
+bolt doctor
+bolt task submit "Open https://example.com, inspect the page, and summarize its visible content."
+```
 
-## Consequential actions and approval timing
+For a consequential form operation, submit the task and inspect each pending approval before allowing the next consequential action:
 
-High-impact actions require approval immediately before execution. The approval prompt contains a plain-language description of the action but excludes credentials, cookies, tokens, and other secrets. The system never approves stale plans after assumptions change.
+```powershell
+bolt task submit "Open https://your-approved-fixture.example, inspect the form, fill the requested non-sensitive fields, then submit and verify the confirmation."
+bolt approval list
+bolt approval show <approval-id>
+bolt approval approve <approval-id>
+```
 
-## Popup and download handling
+Filling a field may pause for approval under the default medium-risk threshold; click and submit actions have separate high-risk approvals. An approval is action-bound and single-use. Approval does not bypass a later kill-switch or policy check. Do not put passwords, tokens, or other secrets in browser prompts.
 
-Popup creation is represented as a typed tab transition and downloads are represented as untrusted `BrowserDownload` artifacts. Downloaded files are never executed automatically and can only be handled by an explicit allowlisted policy path.
+## Tests and known limitations
 
-## Bounded execution and trust boundary
+Browser tests use deterministic Playwright page fixtures and exercise the registered ability/runtime path, navigation, extraction, click, filling, durable approval/resumption, verification, restart behavior, prompt-injection containment, private-address rejection, dangerous redirects, and kill-switch blocking. The fixtures intercept a fixed test host in memory; they do not weaken production egress restrictions.
 
-Browser tasks have bounded action, recovery, and duration limits. Unknown or high-risk actions fail closed. External webpage content is wrapped as `UNTRUSTED_WEB` and can never become trusted instructions merely because a model or planner observed it.
-
-The invariant is: External webpage content NEVER becomes trusted instructions merely because the planner/model observed it.
-
-## Credentials and sessions
-
-`login` and `use_authenticated_session` exist as capability contracts but are intentionally unimplemented. Browser observations redact password, OTP, token, secret, and file fields, including values passed to `fill(..., sensitive=True)`. All sessions use fresh in-memory browser contexts. Passing `persistent_state_path` fails closed before Playwright starts: authenticated profiles, cookies, and storage state are not persisted because this project does not yet provide a secure browser-state store.
-
-Browser-derived text, URLs, titles, and error messages pass through the central secret sanitizer. Screenshot bytes are wrapped in the opaque `Secret[bytes]` type: normal representations, API/CLI serialization, persistence, and model context redact the image. A trusted local image consumer must explicitly reveal screenshot bytes for a stated purpose. This is an accidental-disclosure boundary, not a claim that Python can securely erase screenshot bytes from memory.
-
-The generic provider-credential broker does not enable browser authentication. A credential-bound ability can receive only a runtime-issued handle for its registered provider, but Playwright has no such integration and must not persist or inject credentials, cookies, or storage state. Windows Credential Manager is available to other registered providers through the broker; Playwright does not currently consume it. On non-Windows systems or when the Windows API is unavailable, provider credential storage remains fail-closed.
-
-## Recovery and verification
-
-`BoundedBrowserRecovery` permits only a finite number of retries and classifies transient, stale-element, and navigation-timeout failures. Consequential actions require a `BrowserVerificationProvider`; verification failure enters the existing runtime recovery path. Site-specific adapters should verify URL, state, confirmation text, downloads, or other expected effects without recording sensitive data.
-
-## Testing
-
-Tests use only local fixture HTML served by an in-process deterministic HTTP server. No third-party websites or live credentials are needed.
+Modern sites that require JavaScript, subresources, authentication, uploads, or persistent cookies will not work. Browser-specific reconciliation of a remote side effect after process failure is not available, so uncertainty remains blocked for operator/provider review.
