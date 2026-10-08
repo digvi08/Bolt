@@ -15,7 +15,7 @@ Do not interpret a passing test suite as evidence that unsupported integrations 
 - Durable SQLite task/action/schedule/audit state at the per-user application-data path documented in the README, plus exclusive process ownership for the composed application. `:memory:` is for isolated tests, not recovery.
 - Restart recovery that marks interrupted external actions uncertain and blocks automatic replay. A separate reconciler protocol can resolve outcomes when a provider supplies independent evidence; unsupported providers remain blocked.
 - A persistent local kill switch with CLI engage/release/status commands and an additional environment fail-safe override.
-- A fresh synchronous approval prompt for CLI actions requiring approval when the CLI has an interactive terminal. Prompt details are sanitized. Embedding applications can inject an approval provider. A missing or noninteractive approver denies the action.
+- Durable SQLite-backed action approvals with expiration and action fingerprinting. The CLI and authenticated API let an operator list, inspect, approve, or deny a pending action; approval resumes the waiting task through the execution loop. The application creates this provider by default, and embedding applications may inject another approval provider.
 - Windows Credential Manager integration for scoped provider credentials where the OS binding is available. Provider credential metadata is kept separately from values.
 
 ## CURRENT CAPABILITIES
@@ -53,7 +53,7 @@ Set `BOLT_WORKSPACE_ROOT` to an existing directory and allow `read_only` for lis
 
 ## APPROVAL
 
-The CLI injects an explicit synchronous prompt only when connected to an interactive terminal. It displays sanitized action details and requires the exact answer `y`; EOF, `yes`, or noninteractive use denies. The same current provider is used for restart reconciliation when current policy requires approval. There is no durable pending-approval queue or API approval endpoint. Remote callers cannot approve actions.
+The application persists pending approvals in SQLite and binds each approval to a fingerprint of the task, caller, action, ability, provider, risk, and parameters. The default decision window is 15 minutes. Operators can use `bolt approval list`, `bolt approval show <approval-id>`, `bolt approval approve <approval-id>`, and `bolt approval deny <approval-id>`. Approval re-enters the task execution loop, where current runtime policy, kill-switch, and action checks still apply; a decision does not bypass those controls. The authenticated API exposes `GET /approvals`, `GET /approvals/{approval_id}`, `POST /approvals/{approval_id}/approve`, and `POST /approvals/{approval_id}/deny`. These operations require `approval.read`, `approval.approve`, or `approval.deny`; corresponding `:any` scopes explicitly grant cross-caller access. The default API listener is local-only. This is a single-operator decision workflow, not a multi-person quorum or distributed worker lease.
 
 ## KILL SWITCH
 
@@ -73,12 +73,12 @@ The model is a proposer only. External web and workspace text is untrusted. The 
 
 ## TESTS
 
-Run `python -m pytest --collect-only -q`, `python -m pytest -q`, `ruff check src tests`, `mypy src`, and `git diff --check`. Current validation collected 270 tests and completed with **269 passed, 1 skipped**; Ruff, mypy, and the diff check passed. These checks do not certify unsupported browser, durable-approval, or scheduled-model workflows.
+Run `python -m pytest --collect-only -q`, `python -m pytest -q`, `ruff check src tests`, `mypy src`, and `git diff --check`. Current validation collected 270 tests and completed with **269 passed, 1 skipped**; Ruff, mypy, and the diff check passed. Tests do not certify unsupported browser or scheduled-model workflows, nor replace production deployment and provider validation.
 
 ## LIMITATIONS
 
 - Browser functionality is intentionally unavailable pending a defensible network-isolation implementation and end-to-end tests.
-- Durable pending approvals and authenticated remote approval are not implemented.
+- Multi-person approval quorum and distributed approval/execution workers are not implemented; the durable workflow is scoped to the single local application owner.
 - Model-driven scheduled research/report jobs do not use the model ability loop.
 - No live model endpoint or production verification provider is configured by default.
 - Exactly-once external execution cannot be guaranteed by local SQLite.
@@ -97,7 +97,7 @@ bolt doctor
 bolt safety kill-switch status
 ```
 
-Add `$env:BOLT_MODEL_BASE_URL`, `$env:BOLT_MODEL_NAME`, and (for remote HTTPS providers) `$env:BOLT_MODEL_API_KEY` to opt into model planning. Do not put the key in command arguments or task text. Attach a terminal for approval prompts. The default database is under the current user's local application-data directory; `--database <path>` overrides it per command.
+Add `$env:BOLT_MODEL_BASE_URL`, `$env:BOLT_MODEL_NAME`, and (for remote HTTPS providers) `$env:BOLT_MODEL_API_KEY` to opt into model planning. Do not put the key in command arguments or task text. Review outstanding actions with `bolt approval list`; use `bolt approval show`, `approve`, or `deny` with the approval ID to make a decision. The default database is under the current user's local application-data directory; `--database <path>` overrides it per command.
 
 ## EXAMPLES
 
@@ -109,12 +109,15 @@ bolt task submit "fetch https://docs.python.org/3/whatsnew/3.13.html"
 bolt task submit "list files"
 bolt task submit "read file README.md"
 bolt task submit "create file research-notes.txt with key findings"
+bolt approval list
+bolt approval show <approval-id>
+bolt approval approve <approval-id>
 bolt action uncertain --json
 bolt safety kill-switch engage
 bolt safety kill-switch release
 ```
 
-The file-creation example prompts for current approval in an interactive terminal. The final two examples are local operator controls. Browser actions and scheduled model-research workflows are not examples because those features are not currently supported.
+The file-creation example may leave a pending approval for the operator to review and decide using the approval commands. The final two examples are local operator controls. Browser actions and scheduled model-research workflows are not examples because those features are not currently supported.
 
 ## What is deliberately unsupported
 
@@ -123,7 +126,7 @@ The file-creation example prompts for current approval in an interactive termina
 - **Desktop, terminal, administrator, arbitrary filesystem, and destructive actions:** these are not built-in execution capabilities.
 - **Reliable verification by default:** no production verification provider is configured. A provider's successful return or a local journal flag is not independent evidence of an external effect.
 - **Provider-specific browser reconciliation:** the application cannot infer a remote side effect from a page still being open. Browser actions interrupted during execution remain uncertain and blocked.
-- **Durable approval workflow:** CLI confirmation is synchronous, not a pending approval queue. No authenticated API operation can approve or deny an action.
+- **Multi-person or distributed approvals:** the approval record is durable, but the application does not implement quorum decisions or distributed execution/approval workers.
 - **Distributed execution:** SQLite and the process lock support one local application owner, not multi-host workers or distributed leases.
 
 ## Operating guidance
@@ -143,7 +146,6 @@ The file-creation example prompts for current approval in an interactive termina
 | Browser route/subresource enforcement and a registered, safe browser capability | Implementation work still needed | Browser ability remains unavailable; enabling the existing raw Playwright navigation path would be unsafe. |
 | Browser-specific independent verification/reconciliation | Provider capability limitation and implementation work still needed | Interrupted browser side effects cannot be safely resolved automatically and remain blocked. |
 | Atomicity across an external provider side effect and SQLite journal commit | Fundamentally impossible to guarantee with a local transaction | A crash can always leave an uncertain outcome; provider idempotency or independent reconciliation is needed to resolve it. |
-| Durable pending approvals and an authenticated approve/deny workflow | Implementation work still needed | API/noninteractive high-impact actions fail closed; only interactive CLI confirmation is available. |
 | Natural-language scheduler dispatch through the model/ability loop | Implementation work still needed | Current scheduler stores and dispatches direct runtime actions; do not expect it to run model-planned research tasks. |
 | Production verification adapters for actual external effects | Provider capability limitation and deployment/configuration work | Completion is not independently verified unless the application injects a trustworthy verifier. |
 | OS-backed credential backend outside supported Windows configuration | Deployment/configuration work | Credential-value operations fail closed on unsupported platforms. |

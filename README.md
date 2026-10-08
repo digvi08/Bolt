@@ -17,11 +17,11 @@ The default configuration is deny-by-default. Integrations must implement the in
 
 ## Local workflows and diagnostics
 
-Run `bolt doctor` (or `bolt doctor --json`) to inspect the database, current allowlist, configured workspace, registered built-in abilities, provider credential-store availability, recovery state, kill-switch state, and whether model, approval, and verification providers are configured. No AI model is enabled by default. Registered web/workspace abilities use bounded provider-specific postcondition checks; no general external-side-effect verifier is configured by default. The CLI supplies a synchronous human approval prompt only when attached to an interactive terminal; embedding applications must inject their own approval provider.
+Run `bolt doctor` (or `bolt doctor --json`) to inspect the database, current allowlist, configured workspace, registered built-in abilities, provider credential-store availability, recovery state, kill-switch state, and whether model, approval, and verification providers are configured. No AI model is enabled by default. Registered web/workspace abilities use bounded provider-specific postcondition checks; no general external-side-effect verifier is configured by default. The application creates a durable approval provider by default; operators review pending actions with `bolt approval` or the authenticated API. Embedding applications may inject a different approval provider.
 
 The CLI can enable bounded public web reads only when both `BOLT_ALLOWED_ACTIONS=network_read` and `BOLT_ENABLE_EXTERNAL_INTEGRATIONS=true` are explicitly set. Use `bolt task submit "search the web for ..."` or `bolt task submit "fetch https://example.org/"`. Search uses Bing's public RSS results for personal, non-commercial rendering. Web output is marked as untrusted data and returned separately from task authorization. Fetch follows at most four redirects, resolves and validates every destination, pins the connection to a validated public address, verifies HTTPS certificates, rejects compressed/unsupported/oversized responses, and sends no cookies, credentials, or caller-supplied headers. Ordinary HTTP is supported but reported as insecure. Search-provider availability/rate limits and Bing's usage terms apply.
 
-For bounded workspace access, set `BOLT_WORKSPACE_ROOT` to an existing directory and `BOLT_ALLOWED_ACTIONS=read_only` to list/read using `bolt task submit "list files"` or `bolt task submit "read file notes.txt"`. The ability refuses path escapes and symlinks, caps content and directory sizes, and returns file contents as untrusted document data. Creating a new file is supported only under an existing parent directory and requires the separate `write_file` permission plus current policy approval; an interactive CLI provides a one-shot confirmation, while embedding applications must inject a trusted approval provider. Existing files are never overwritten. If the process exits during file creation, startup reconciliation compares the target with the persisted intent: exact content confirms completion, a missing target confirms no write, and any mismatch remains uncertain and blocked. SQLite and the filesystem are not atomic together. The boundary is intended for a locally controlled workspace; it does not defend against a hostile same-user process racing filesystem path changes.
+For bounded workspace access, set `BOLT_WORKSPACE_ROOT` to an existing directory and `BOLT_ALLOWED_ACTIONS=read_only` to list/read using `bolt task submit "list files"` or `bolt task submit "read file notes.txt"`. The ability refuses path escapes and symlinks, caps content and directory sizes, and returns file contents as untrusted document data. Creating a new file is supported only under an existing parent directory and requires the separate `write_file` permission plus current policy approval. When approval is required, the action remains pending until an operator approves or denies it with `bolt approval`; existing files are never overwritten. If the process exits during file creation, startup reconciliation compares the target with the persisted intent: exact content confirms completion, a missing target confirms no write, and any mismatch remains uncertain and blocked. SQLite and the filesystem are not atomic together. The boundary is intended for a locally controlled workspace; it does not defend against a hostile same-user process racing filesystem path changes.
 
 The local kill switch is persisted with the application database and checked on every runtime decision. Use `bolt safety kill-switch engage` to stop new actions and `bolt safety kill-switch release` to resume them; `bolt safety kill-switch status` reports the effective state. `BOLT_KILL_SWITCH_ACTIVE=true` remains an additional fail-safe override and cannot be cleared by the CLI while asserted. The control is local-only and is not exposed through the HTTP API.
 
@@ -53,13 +53,13 @@ The approval system decouples approval from execution, enabling operators to rev
 - **Action fingerprinting**: SHA256 hash of task, action, caller, ability, and parameters prevents approval tampering and ensures distinct action variants require separate approvals
 - **Expiration windows**: 15-minute default TTL with timezone-aware clock; expired approvals auto-downgrade and cannot be consumed
 - **Idempotent claim**: Concurrent runtime claims race safely; only one succeeds and transitions APPROVED → CONSUMED; others see stale state
-- **Dual-path approval**: Runtime distinguishes synchronous denial (interactive CLI) from deferred pending (durable provider) and avoids replanning during approval window
+- **Deferred execution**: Actions requiring approval are persisted as pending; the executor waits without replanning and resumes the task after approval
 - **Service-layer operations**: `list_approvals()`, `get_approval()`, `approve_approval()`, `deny_approval()` with task resumption after approval
 - **API endpoints**: `GET /approvals`, `GET /approvals/{id}`, `POST /approvals/{id}/approve`, `POST /approvals/{id}/deny` with scope enforcement and resource ownership
-- **CLI operator interface**: `bolt approval list`, `bolt approval show`, `bolt approval approve`, `bolt approval deny` for remote decision-making without long-running CLI session
+- **CLI operator interface**: `bolt approval list`, `bolt approval show`, `bolt approval approve`, and `bolt approval deny` let a local operator decide without keeping the task command open
 - **Auto-provisioning**: `DurableApprovalProvider` is created automatically at application startup if no approval provider is configured
 
-The durable provider is suitable for distributed systems where operators and agents run independently. Approval decisions are persisted and audited; tasks waiting for approval set phase to `awaiting_approval` and do not proceed with planning until approved or denied.
+Approval decisions are persisted and audited; tasks waiting for approval set phase to `awaiting_approval`. Approval is bound to the action fingerprint and expires after the configured provider TTL (15 minutes by default). The application is a single local process owner, not a distributed worker system. An authenticated API is available for approval operations when the API is enabled and callers have the relevant approval scopes.
 
 ## Agent brain milestone
 
@@ -127,7 +127,7 @@ py -m pip install -e .
 bolt --help
 ```
 
-The CLI is a thin local operator interface over `AgentService`; it does not connect directly to action providers, change policy, change risk, or retry uncertain actions. In an interactive terminal, actions requiring approval receive a fresh synchronous confirmation displaying sanitized action details; noninteractive invocations fail closed when approval is unavailable. Its default bootstrap is deny-by-default, and abilities are registered only when their explicit configuration gates are enabled.
+The CLI is a thin local operator interface over `AgentService`; it does not connect directly to action providers, change policy, change risk, or retry uncertain actions. Actions requiring approval are held pending for an explicit operator decision using `bolt approval list|show|approve|deny`; decisions are durable and action-bound. Its default bootstrap is deny-by-default, and abilities are registered only when their explicit configuration gates are enabled.
 
 Examples:
 
@@ -137,6 +137,9 @@ bolt task list --limit 20
 bolt task get <task-uuid>
 bolt action uncertain --json
 bolt action reconcile <execution-id>
+bolt approval list
+bolt approval show <approval-id>
+bolt approval approve <approval-id>
 bolt schedule create --objective "Inspect status" --action-name browser.observe --action-kind read_only --run-at 2030-01-02T03:04:05Z --parameters-json '{"url":"https://example.invalid"}'
 bolt scheduler status
 bolt audit list --task-id <task-uuid> --limit 50 --json
@@ -170,7 +173,7 @@ The `create` and `rotate` commands display the newly generated bearer token once
 
 Requests use `Authorization: Bearer <token>`. Authenticated caller identity is derived from the credential ID; caller identity fields in request bodies are rejected. Task submission requires `Idempotency-Key`; the authenticated identity and key are passed to `AgentService`'s existing transactional idempotency mechanism. The same caller/key/objective returns the original task, a different objective conflicts, and another caller has an independent key namespace. Other mutating operations retain their existing service semantics; no second API idempotency database is introduced.
 
-The exact scope strings are `application.read`, `task.read`, `task.read:any`, `task.submit`, `task.cancel`, `task.cancel:any`, `action.read`, `action.read:any`, `action.reconcile`, `action.reconcile:any`, `schedule.read`, `schedule.read:any`, `schedule.create`, `schedule.modify`, `schedule.modify:any`, `schedule.cancel`, `schedule.cancel:any`, `scheduler.read`, `scheduler.control`, `audit.read`, `audit.read:any`, and `safety.read`. There is no generic administrator scope. The `*:any` scopes are explicit cross-resource grants and do not grant unrelated operations; they supplement, rather than replace, the matching base operation scope. For example, `task.read:any` does not allow cancelling another caller's task; cross-caller cancellation requires both `task.cancel` and `task.cancel:any`. Resources submitted through the API are associated with the authenticated credential identity; callers without matching ownership receive not-found responses.
+The exact scope strings are `application.read`, `task.read`, `task.read:any`, `task.submit`, `task.cancel`, `task.cancel:any`, `action.read`, `action.read:any`, `action.reconcile`, `action.reconcile:any`, `schedule.read`, `schedule.read:any`, `schedule.create`, `schedule.modify`, `schedule.modify:any`, `schedule.cancel`, `schedule.cancel:any`, `scheduler.read`, `scheduler.control`, `audit.read`, `audit.read:any`, `safety.read`, `approval.read`, `approval.read:any`, `approval.approve`, `approval.approve:any`, `approval.deny`, and `approval.deny:any`. There is no generic administrator scope. The `*:any` scopes are explicit cross-resource grants and do not grant unrelated operations; they supplement, rather than replace, the matching base operation scope. For example, `task.read:any` does not allow cancelling another caller's task; cross-caller cancellation requires both `task.cancel` and `task.cancel:any`. Resources submitted through the API are associated with the authenticated credential identity; callers without matching ownership receive not-found responses.
 
 Routes:
 
@@ -178,6 +181,7 @@ Routes:
 - Actions: `GET /actions/{action_id}`, `GET /actions/{action_id}/history`, `GET /actions/uncertain`, `POST /actions/{action_id}/reconcile`.
 - Schedules: `POST /schedules`, `GET /schedules`, `GET /schedules/{schedule_id}`, and `POST /schedules/{schedule_id}/{enable|disable|cancel}`.
 - Scheduler: `GET /scheduler/status` and `POST /scheduler/{run-once|start|stop|shutdown}`.
+- Approvals: `GET /approvals`, `GET /approvals/{approval_id}`, `POST /approvals/{approval_id}/approve`, and `POST /approvals/{approval_id}/deny`.
 - Audit and safety: `GET /audit`, `GET /safety/status`.
 
 The FastAPI-generated schema is available at authenticated `GET /openapi.json`, with Swagger UI at `/docs`. Each request receives an `X-Request-ID` response header (a caller-supplied value is accepted only when it is a UUID); structured errors use `{"error":{"code":"...","message":"...","request_id":"..."}}`. Error codes include `INVALID_REQUEST`, `AUTHENTICATION_FAILED`, `AUTHORIZATION_DENIED`, `NOT_FOUND`, `APPROVAL_REQUIRED`, `POLICY_DENIED`, `KILL_SWITCH_ACTIVE`, `UNCERTAIN`, `CONFLICT`, `UNSUPPORTED_CAPABILITY`, `TIMEOUT`, `RATE_LIMITED`, and `INTERNAL_FAILURE`. Authentication failures are rate-limited in-process to five consecutive failures per peer per 60-second window. This is local abuse protection, not a distributed rate limiter.
