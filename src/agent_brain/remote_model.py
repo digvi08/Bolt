@@ -96,6 +96,40 @@ class OpenAICompatibleProvider:
             raise TypeError("model response does not match the requested schema")
         return schema(**payload)
 
+    def is_available(self) -> bool:
+        """Check the bounded model-list endpoint without generating model output."""
+        headers = {"Accept": "application/json"}
+        if self.api_key is not None:
+            key = self.api_key.reveal(purpose="model provider health check")
+            if not key or "\r" in key or "\n" in key:
+                return False
+            headers["Authorization"] = "Bearer " + key
+        request = Request(
+            self.base_url.rstrip("/") + "/models",
+            headers=headers,
+            method="GET",
+        )
+        try:
+            with urlopen(
+                request,
+                timeout=min(self.timeout_seconds, 2.0),
+                context=ssl.create_default_context(),
+            ) as response:
+                raw = response.read(_MAX_RESPONSE_BYTES + 1)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+            return False
+        if len(raw) > _MAX_RESPONSE_BYTES:
+            return False
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return False
+        models = payload.get("data") if isinstance(payload, dict) else None
+        return isinstance(models, list) and any(
+            isinstance(model, dict) and model.get("id") == self.model_name
+            for model in models
+        )
+
     def _complete(
         self,
         messages: list[dict[str, str]],

@@ -1112,6 +1112,15 @@ def test_state_machine_rejects_illegal_task_transitions(current, next_status):
         TaskStateMachine.assert_transition(current, next_status)
 
 
+def test_state_machine_allows_execution_to_pause_for_durable_approval():
+    from agent_core.persistence import TaskStateMachine
+
+    assert TaskStateMachine.assert_transition(
+        TaskStatus.EXECUTING,
+        TaskStatus.AWAITING_APPROVAL,
+    )
+
+
 def test_malicious_memory_is_context_data_not_authorization(tmp_path):
     store = SQLiteTaskStore(tmp_path / "state.db")
     task_id = uuid4()

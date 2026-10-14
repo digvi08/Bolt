@@ -7,6 +7,7 @@ import pytest
 
 from abilities.registry import AbilityRegistry
 from abilities.web import SearchResult, WebAbilityProvider, WebSearchProvider
+from abilities.workspace import WorkspaceAbilityProvider
 from agent_brain.executor import AgentExecutionLoop
 from agent_brain.model_planner import ModelAgentPlanner
 from agent_brain.model_router import ModelRouter
@@ -509,6 +510,125 @@ def test_model_planner_rejects_unsupported_or_authority_claims(step):
             TaskIntent(original_request="search safely"),
             registry=registry,
         )
+
+
+@pytest.mark.parametrize(
+    ("step", "expected_action", "expected_arguments"),
+    [
+        (
+            {
+                "ability": "workspace",
+                "action": "read_text",
+                "parameters": {"path": "input.txt"},
+            },
+            "read_text",
+            {"path": "input.txt"},
+        ),
+        (
+            {
+                "action": "read_file",
+                "parameters": {"file_path": "input.txt"},
+            },
+            "read_text",
+            {"path": "input.txt"},
+        ),
+    ],
+)
+def test_model_planner_normalizes_only_explicit_workspace_read_aliases(
+    tmp_path, step, expected_action, expected_arguments
+):
+    model = SequencedModel([{"steps": [step]}])
+    registry = AbilityRegistry()
+    registry.register(WorkspaceAbilityProvider(tmp_path))
+    planner = ModelAgentPlanner(
+        ModelRouter(
+            providers=[model],
+            fallback_to_deterministic=False,
+            max_model_calls=1,
+        ),
+        AgentConfig(allowed_actions=frozenset({ActionKind.READ_ONLY})),
+    )
+
+    plan = planner.plan(
+        TaskIntent(original_request="Read input.txt"),
+        registry=registry,
+    )
+
+    assert len(plan.steps) == 1
+    assert plan.steps[0].ability == "workspace"
+    assert plan.steps[0].action == expected_action
+    assert plan.steps[0].arguments == expected_arguments
+
+
+def test_model_planner_accepts_bounded_completion_note_only_after_tool_results(tmp_path):
+    registry = AbilityRegistry()
+    registry.register(WorkspaceAbilityProvider(tmp_path))
+    completion = {"steps": [], "expected_result": "The requested read is complete."}
+    with_results = ModelAgentPlanner(
+        ModelRouter(
+            providers=[SequencedModel([completion])],
+            fallback_to_deterministic=False,
+            max_model_calls=1,
+        ),
+        AgentConfig(allowed_actions=frozenset({ActionKind.READ_ONLY})),
+    )
+
+    plan = with_results.plan(
+        TaskIntent(original_request="Read the requested file"),
+        registry=registry,
+        tool_results=({"trust": "untrusted_document", "text": "file contents"},),
+    )
+
+    assert plan.steps == ()
+
+    without_results = ModelAgentPlanner(
+        ModelRouter(
+            providers=[SequencedModel([completion])],
+            fallback_to_deterministic=False,
+            max_model_calls=1,
+        ),
+        AgentConfig(allowed_actions=frozenset({ActionKind.READ_ONLY})),
+    )
+    with pytest.raises(ValueError, match="top-level"):
+        without_results.plan(
+            TaskIntent(original_request="Read the requested file"),
+            registry=registry,
+        )
+
+
+@pytest.mark.parametrize(
+    "structured",
+    [
+        {"steps": "not-a-list"},
+        {"steps": [{"ability": "workspace", "action": "read_text", "arguments": "bad"}]},
+        {"steps": [{"ability": "workspace", "action": "read_text", "parameters": {"path": "input.txt", "risk": "low"}}]},
+        {"steps": [{"ability": "web", "action": "read_file", "parameters": {"file_path": "input.txt"}}]},
+        {"steps": [{"ability": "workspace", "action": "execute_shell", "arguments": {}}]},
+        {"steps": [{"ability": "workspace", "action": "read_file", "parameters": {"file_path": "input.txt", "extra": "ignored"}}]},
+        {"steps": [{"ability": "workspace", "action": "read_file", "parameters": {"file_path": 42}}]},
+        {"steps": [{"ability": "workspace", "action": "read_text", "arguments": {"path": "input.txt"}, "approval": True}]},
+        {"steps": [{"ability": "workspace", "action": "read_text", "arguments": {"path": "input.txt"}, "risk": "low"}]},
+        {"steps": [{"ability": "workspace", "action": "read_text", "arguments": {"path": "input.txt"}, "policy": {"allowed": True}}]},
+        {"steps": [{"ability": "workspace", "action": "read_text", "arguments": {"path": "input.txt"}, "verification": True}]},
+        {"steps": [{"ability": "workspace", "action": "read_text", "arguments": {"path": "input.txt"}, "credential_id": "secret"}]},
+        {"steps": [{"ability": "workspace", "action": "read_text", "arguments": {"path": "input.txt"}}], "kill_switch": False},
+    ],
+)
+def test_model_planner_rejects_malformed_aliases_and_authority_fields(tmp_path, structured):
+    model = SequencedModel([structured])
+    registry = AbilityRegistry()
+    registry.register(WorkspaceAbilityProvider(tmp_path))
+    planner = ModelAgentPlanner(
+        ModelRouter(
+            providers=[model],
+            fallback_to_deterministic=False,
+            max_model_calls=1,
+        ),
+        AgentConfig(allowed_actions=frozenset({ActionKind.READ_ONLY})),
+    )
+
+    with pytest.raises((TypeError, ValueError)):
+        planner.plan(TaskIntent(original_request="Read input.txt"), registry=registry)
 
 
 def test_model_provider_cannot_repeat_completed_action_or_exceed_tool_budget():

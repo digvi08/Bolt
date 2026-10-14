@@ -303,6 +303,10 @@ class AgentExecutionLoop:
                         False, task.id, intent=intent, plan=plan,
                         reason="kill switch engaged", decision=decision,
                     )
+                if task.status is TaskStatus.SUCCEEDED:
+                    self._set_task_status(task, TaskStatus.EXECUTING)
+                    task.current_phase = "planning"
+                    self._persist_task(task, "task.followup_planning")
                 try:
                     model_plan = planner.plan(
                         intent,
@@ -506,6 +510,7 @@ class AgentExecutionLoop:
                     ModelRequest(
                         prompt=synthesis_prompt[:24_000],
                         task_type="reasoning",
+                        latency_budget_ms=self.config.max_task_duration_ms,
                         max_attempts=1,
                         max_tokens=1024,
                         system_prompt=(

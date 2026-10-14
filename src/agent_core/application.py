@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import math
 import os
@@ -324,6 +325,15 @@ class AgentApplication:
             )
         )
         model_configured = self._model_router is not None and bool(self._model_router.providers)
+        model_available: bool | None = None
+        if model_configured and self._model_router is not None:
+            availability_checks = [
+                checker
+                for provider in self._model_router.providers
+                if callable(checker := getattr(provider, "is_available", None))
+            ]
+            if availability_checks:
+                model_available = any(checker() for checker in availability_checks)
         web_enabled = "web" in available
         scheduler_running = False
         if self._service is not None:
@@ -336,6 +346,24 @@ class AgentApplication:
             if self.database_path is not None
             else str(SQLiteTaskStore.default_path())
         )
+        playwright_installed = importlib.util.find_spec("playwright") is not None
+        chromium_installed = False
+        chromium_check = "Playwright is not installed"
+        if playwright_installed:
+            try:
+                from playwright.sync_api import sync_playwright
+
+                with sync_playwright() as playwright:
+                    chromium_path = Path(playwright.chromium.executable_path)
+                chromium_installed = chromium_path.is_file()
+                chromium_check = (
+                    "Chromium executable is installed"
+                    if chromium_installed
+                    else "Chromium executable is missing; run `py -m playwright install chromium`"
+                )
+            except (OSError, RuntimeError) as error:
+                chromium_check = f"Chromium check failed ({type(error).__name__})"
+        workspace_exists = self.workspace_root is not None and self.workspace_root.is_dir()
         return {
             "application_state": self.state.value,
             "database_path": database,
@@ -361,10 +389,26 @@ class AgentApplication:
             "browser": {
                 "available": "browser" in available,
                 "status": "enabled" if "browser" in available else "unsupported_not_registered",
+                "playwright_installed": playwright_installed,
+                "chromium_installed": chromium_installed,
+                "diagnostic": chromium_check,
             },
             "web_search": {"available": web_enabled, "provider": "registered_web_ability" if web_enabled else "disabled"},
             "web_fetch": {"available": web_enabled, "provider": "registered_web_ability" if web_enabled else "disabled"},
-            "workspace": {"configured": self.workspace_root is not None, "available": "workspace" in available},
+            "workspace": {
+                "configured": self.workspace_root is not None,
+                "valid": workspace_exists,
+                "available": "workspace" in available,
+                "diagnostic": (
+                    "Workspace root is available"
+                    if workspace_exists
+                    else (
+                        "BOLT_WORKSPACE_ROOT is unset"
+                        if self.workspace_root is None
+                        else "Workspace root does not exist or is not a directory"
+                    )
+                ),
+            },
             "external_integrations_enabled": self.config.enable_external_integrations,
             "approval_provider_available": self._approval_provider is not None,
             "approval_provider": {
@@ -377,8 +421,33 @@ class AgentApplication:
                 "mode": "configured" if verification_available else "unavailable",
             },
             "model_provider_configured": model_configured,
+            "model_provider_ready": model_available is True,
             "model_provider": {
                 "configured": model_configured,
+                "available": model_available,
+                "ready": model_available is True,
+                "status": (
+                    "ready"
+                    if model_available is True
+                    else (
+                        "unavailable"
+                        if model_available is False
+                        else "not_probed"
+                    )
+                ),
+                "diagnostic": (
+                    "Configured model is listed by its provider endpoint"
+                    if model_available is True
+                    else (
+                        "Provider endpoint is unavailable or does not list the configured model"
+                        if model_available is False
+                        else (
+                            "Provider is configured, but does not expose a readiness check"
+                            if model_configured
+                            else "No model provider is configured"
+                        )
+                    )
+                ),
                 "provider_count": (
                     len(self._model_router.providers)
                     if model_configured and self._model_router is not None
@@ -440,8 +509,10 @@ class AgentApplication:
                         fetcher=self._web_fetcher,
                     )
                 )
-            if self.workspace_root is not None:
+            if self.workspace_root is not None and self.workspace_root.is_dir():
                 registry.register(WorkspaceAbilityProvider(self.workspace_root))
+            elif self.workspace_root is not None:
+                self._audit("application.workspace_unavailable")
             if (
                 ActionKind.BROWSER in self.config.allowed_actions
                 and self.config.enable_external_integrations
@@ -502,9 +573,11 @@ class AgentApplication:
                     api_credentials,
                     lifecycle_state=lambda: self.state.value,
                     lifecycle_status=self.status,
+                    lifecycle_diagnostics=self.diagnostics,
                     lifecycle_start_scheduler=self.start_scheduler,
                     lifecycle_stop_scheduler=self.stop_scheduler,
                     lifecycle_run_scheduler_once=self.run_scheduler_once,
+                    lifecycle_set_kill_switch=self.set_kill_switch_active,
                 )
                 self._attach_api_lifecycle()
 
@@ -733,6 +806,12 @@ class AgentApplication:
 
     async def _start_configured_scheduler(self) -> None:
         if not self._api_configured_scheduler:
+            return
+        if self.state is ApplicationState.DEGRADED:
+            self._audit(
+                "application.scheduler_start_blocked_recovery",
+                recovery_status=self._recovery_status,
+            )
             return
         try:
             await self.start_scheduler()

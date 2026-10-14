@@ -150,6 +150,11 @@ class ScheduleBody(BaseModel):
         return value
 
 
+class KillSwitchBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    active: bool
+
+
 class ApiMiddleware:
     def __init__(
         self,
@@ -186,7 +191,14 @@ class ApiMiddleware:
 
         peer = request.client.host if request.client is not None else "unknown"
         try:
-            if self._lifecycle_state is not None:
+            public_ui_asset = (
+                request.method in {"GET", "HEAD"}
+                and (
+                    request.url.path in {"/", "/ui"}
+                    or request.url.path.startswith("/assets/")
+                )
+            )
+            if self._lifecycle_state is not None and not public_ui_asset:
                 lifecycle_state = self._lifecycle_state()
                 status_request = request.method == "GET" and request.url.path == "/application/status"
                 if lifecycle_state not in {"ready", "degraded"} and not status_request:
@@ -215,6 +227,9 @@ class ApiMiddleware:
                 and request.headers.get("access-control-request-method") is not None
             )
             if is_cors_preflight:
+                await self._app(scope, receive, send_with_request_id)
+                return
+            if public_ui_asset:
                 await self._app(scope, receive, send_with_request_id)
                 return
             token = self._bearer_token(request.headers.get("authorization"))
@@ -389,9 +404,11 @@ def create_api_app(
     rate_limiter: AuthenticationRateLimiter | None = None,
     lifecycle_state: Callable[[], str] | None = None,
     lifecycle_status: Callable[[], object] | None = None,
+    lifecycle_diagnostics: Callable[[], object] | None = None,
     lifecycle_start_scheduler: Callable[[], Awaitable[object]] | None = None,
     lifecycle_stop_scheduler: Callable[[], Awaitable[object]] | None = None,
     lifecycle_run_scheduler_once: Callable[[], Awaitable[object]] | None = None,
+    lifecycle_set_kill_switch: Callable[[bool], bool] | None = None,
 ) -> FastAPI:
     """Create a protected API app; app lifecycle does not implicitly start the scheduler."""
     origins = tuple(cors_origins)
@@ -799,6 +816,20 @@ def create_api_app(
         )
         return JSONResponse(content=_jsonable(schedule))
 
+    @app.get("/schedules/{schedule_id}/occurrences", response_model=list[dict[str, Any]])
+    def list_schedule_occurrences(
+        schedule_id: str,
+        principal: ApiPrincipal = Depends(require_scope(ApiScope.SCHEDULE_READ)),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> JSONResponse:
+        schedule = service.get_schedule(schedule_id)
+        ensure_resource_access(
+            principal, "task", str(schedule.task_id), allow_any_scope=ApiScope.SCHEDULE_READ_ANY
+        )
+        return JSONResponse(
+            content=_jsonable(service.list_schedule_occurrences(schedule_id, limit=limit))
+        )
+
     async def mutate_schedule(
         request: Request,
         principal: ApiPrincipal,
@@ -870,7 +901,13 @@ def create_api_app(
         def application_status(
             _principal: ApiPrincipal = Depends(require_scope(ApiScope.APPLICATION_READ)),
         ) -> JSONResponse:
-            return JSONResponse(content=_jsonable(lifecycle_status()))
+            status = _jsonable(lifecycle_status())
+            if lifecycle_diagnostics is not None and isinstance(status, dict):
+                diagnostics = _jsonable(lifecycle_diagnostics())
+                if isinstance(diagnostics, dict):
+                    diagnostics.pop("credential_backend_available", None)
+                    status.update(diagnostics)
+            return JSONResponse(content=status)
 
     @app.post("/scheduler/run-once", response_model=list[dict[str, Any]])
     async def scheduler_run_once(
@@ -994,6 +1031,23 @@ def create_api_app(
     ) -> JSONResponse:
         del principal
         return JSONResponse(content=_jsonable(service.scheduler_status()))
+
+    @app.post("/safety/kill-switch", response_model=dict[str, Any])
+    def set_kill_switch(
+        body: KillSwitchBody,
+        request: Request,
+        principal: ApiPrincipal = Depends(require_scope(ApiScope.SAFETY_CONTROL)),
+    ) -> JSONResponse:
+        if lifecycle_set_kill_switch is None:
+            raise ApiException(ApiErrorCode.APPLICATION_UNAVAILABLE, status_code=503)
+        active = lifecycle_set_kill_switch(body.active)
+        audit(
+            "api.safety_control_requested",
+            request,
+            principal,
+            scope=ApiScope.SAFETY_CONTROL,
+        )
+        return JSONResponse(content={"active": active})
 
     app.state.agent_service = service
     app.state.credential_store = credential_store

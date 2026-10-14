@@ -118,6 +118,11 @@ def _build_parser() -> _Parser:
     doctor = commands.add_parser("doctor", help="diagnose local runtime configuration")
     _json_flag(doctor)
 
+    ui = commands.add_parser("ui", help="start the authenticated local dashboard")
+    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument("--port", type=_positive_int, default=8765)
+    ui.add_argument("--credential-store")
+
     task = commands.add_parser("task", help="inspect and submit tasks")
     task_commands = task.add_subparsers(dest="task_command", required=True, parser_class=_Parser)
     submit = task_commands.add_parser("submit", help="submit a user objective")
@@ -505,6 +510,21 @@ def run_cli(
     except CliUsageError:
         err.write("ERROR: invalid command usage\n")
         return 2
+    if args.top == "ui":
+        from .api_server import main as api_main
+
+        server_args = [
+            "--host",
+            args.host,
+            "--port",
+            str(args.port),
+            "--start-scheduler",
+        ]
+        if args.database:
+            server_args.extend(("--database", args.database))
+        if args.credential_store:
+            server_args.extend(("--credential-store", args.credential_store))
+        return api_main(server_args)
     own_service = service is None
     active_service: AgentService
     application: AgentApplication | None = None

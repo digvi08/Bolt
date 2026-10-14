@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'self'">
+    <meta name="color-scheme" content="light">
+    <title>Bolt | Local Agent Console</title>
+    <link rel="stylesheet" href="/assets/style.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar" aria-label="Main navigation">
+        <a class="brand" href="#dashboard" aria-label="Bolt dashboard">
+          <span class="brand-mark" aria-hidden="true">B</span>
+          <span><strong>Bolt</strong><small>LOCAL AGENT CONSOLE</small></span>
+        </a>
+        <nav id="navigation">
+          <span class="nav-caption">WORKSPACE</span>
+          <a href="#dashboard" data-page="dashboard">◈ <span>Dashboard</span></a>
+          <a href="#tasks" data-page="tasks">▤ <span>Tasks</span></a>
+          <a href="#new-task" data-page="new-task">＋ <span>New task</span></a>
+          <a href="#research" data-page="research">⌕ <span>Research</span></a>
+          <a href="#browser" data-page="browser">◎ <span>Browser</span></a>
+          <span class="nav-caption nav-gap">OPERATIONS</span>
+          <a href="#approvals" data-page="approvals">◇ <span>Approvals</span><span class="nav-count" id="approval-count" hidden>0</span></a>
+          <a href="#schedules" data-page="schedules">◷ <span>Schedules</span></a>
+          <a href="#activity" data-page="activity">≋ <span>Activity &amp; audit</span></a>
+          <a href="#safety" data-page="safety">⛨ <span>Safety</span></a>
+          <a href="#settings" data-page="settings">⚙ <span>Settings &amp; diagnostics</span></a>
+        </nav>
+        <div class="sidebar-foot"><span class="pulse"></span> Local process · loopback only</div>
+      </aside>
+
+      <div class="main-column">
+        <header class="topbar">
+          <div class="crumb"><span class="status-dot"></span><span id="connection-label">Not connected</span></div>
+          <div class="top-actions">
+            <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh current page" title="Refresh">↻</button>
+            <button id="credential-button" class="button button-light" type="button">Connect API</button>
+          </div>
+        </header>
+
+        <section id="notice" class="notice" role="status" aria-live="polite" hidden></section>
+        <main id="content" tabindex="-1"></main>
+        <footer class="footer">Bolt keeps execution, policy, approvals, and verification in the local application.</footer>
+      </div>
+    </div>
+
+    <dialog id="credential-dialog" aria-labelledby="credential-title">
+      <form method="dialog" id="credential-form">
+        <div class="dialog-top">
+          <div><p class="eyebrow">LOCAL API ACCESS</p><h2 id="credential-title">Connect to Bolt</h2></div>
+          <button class="icon-button" value="cancel" aria-label="Close dialog">×</button>
+        </div>
+        <p class="muted">Paste a bearer token issued by <code>bolt-auth</code>. It stays in memory for this tab and is cleared when you disconnect or close it.</p>
+        <label for="api-token">API token</label>
+        <input id="api-token" type="password" autocomplete="off" spellcheck="false" placeholder="bolt.…" required>
+        <div class="command-box">bolt-auth create --scope application.read --scope task.read --scope task.submit<br>See Settings for the full scope set.</div>
+        <div class="dialog-actions">
+          <button class="button button-light" value="cancel">Cancel</button>
+          <button class="button button-primary" id="connect-button" type="button">Connect</button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

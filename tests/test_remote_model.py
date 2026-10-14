@@ -52,6 +52,54 @@ def test_provider_parses_structured_json(monkeypatch: pytest.MonkeyPatch) -> Non
     assert provider.structured_generate("prompt", dict) == {"ok": True}
 
 
+def test_provider_readiness_checks_model_list_without_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request: object, **kwargs: object) -> io.BytesIO:
+        captured["request"] = request
+        captured["kwargs"] = kwargs
+        return io.BytesIO(json.dumps({"data": [{"id": "test-model"}]}).encode())
+
+    monkeypatch.setattr(remote_model, "urlopen", fake_urlopen)
+    provider = OpenAICompatibleProvider(
+        "http://127.0.0.1:11434/v1",
+        "test-model",
+    )
+
+    assert provider.is_available()
+    request = captured["request"]
+    assert request.full_url == "http://127.0.0.1:11434/v1/models"  # type: ignore[attr-defined]
+    assert request.get_method() == "GET"  # type: ignore[attr-defined]
+    assert captured["kwargs"]["timeout"] == 2.0  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"data": [{"id": "different-model"}]},
+        {"data": "malformed"},
+        {"object": "list"},
+    ],
+)
+def test_provider_readiness_fails_closed_when_model_is_not_listed(
+    monkeypatch: pytest.MonkeyPatch,
+    body: dict[str, object],
+) -> None:
+    monkeypatch.setattr(
+        remote_model,
+        "urlopen",
+        lambda *_args, **_kwargs: io.BytesIO(json.dumps(body).encode()),
+    )
+    provider = OpenAICompatibleProvider(
+        "http://127.0.0.1:11434/v1",
+        "test-model",
+    )
+
+    assert not provider.is_available()
+
+
 @pytest.mark.parametrize(
     ("base_url", "model_name"),
     [

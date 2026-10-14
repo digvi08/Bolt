@@ -141,6 +141,8 @@ class SchedulerOccurrenceResponse:
     status: OccurrenceStatus
     success: bool | None
     uncertain: bool
+    scheduled_for: datetime | None = None
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -691,6 +693,32 @@ class AgentService:
         self._validate_limit(limit)
         schedules = self._store.list_schedules()[:limit]
         return tuple(self._schedule_response(item) for item in schedules)
+
+    def list_schedule_occurrences(
+        self, schedule_id: str, *, limit: int = 100
+    ) -> tuple[SchedulerOccurrenceResponse, ...]:
+        self._validate_limit(limit)
+        if self._scheduler_store_schedule(schedule_id) is None:
+            raise AgentServiceError(ServiceErrorCode.SCHEDULE_NOT_FOUND, "schedule not found")
+        occurrences = self._store.list_occurrences(schedule_id)[-limit:]
+        return tuple(
+            SchedulerOccurrenceResponse(
+                schedule_id=item.schedule_id,
+                occurrence_id=item.occurrence_id,
+                status=item.status,
+                success=(
+                    True
+                    if item.status is OccurrenceStatus.COMPLETED
+                    else False
+                    if item.status in {OccurrenceStatus.FAILED, OccurrenceStatus.UNCERTAIN}
+                    else None
+                ),
+                uncertain=item.status is OccurrenceStatus.UNCERTAIN,
+                scheduled_for=item.scheduled_for,
+                updated_at=item.updated_at,
+            )
+            for item in occurrences
+        )
 
     def cancel_schedule(self, schedule_id: str) -> ScheduleResponse:
         schedule = self._scheduler.cancel(schedule_id)

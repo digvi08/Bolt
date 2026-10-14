@@ -19,6 +19,9 @@ bolt = "agent_core.cli:main"
 bolt-api = "agent_core.api_server:main"
 bolt-auth = "agent_core.api_auth_cli:main"
 
+[tool.setuptools.package-data]
+agent_core = ["ui/*.html", "ui/assets/*.css", "ui/assets/*.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"

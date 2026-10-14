@@ -95,6 +95,43 @@ def test_single_application_owns_one_scheduler_and_api_uses_same_service(tmp_pat
     assert application.state is ApplicationState.STOPPED
 
 
+@pytest.mark.parametrize(
+    ("available", "expected_status"),
+    [(True, "ready"), (False, "unavailable")],
+)
+def test_model_diagnostics_distinguish_configured_from_endpoint_readiness(
+    tmp_path,
+    available: bool,
+    expected_status: str,
+) -> None:
+    from agent_brain.model_router import ModelRouter
+
+    class ProbeProvider:
+        name = "probe"
+        model_name = "local-test"
+        capabilities = ("text", "structured")
+
+        def is_available(self) -> bool:
+            return available
+
+    application = AgentApplication(
+        tmp_path / "model-diagnostics.sqlite3",
+        model_router=ModelRouter(
+            providers=[ProbeProvider()],
+            fallback_to_deterministic=False,
+        ),
+    )
+    try:
+        application.start()
+        diagnostics = application.diagnostics()
+        assert diagnostics["model_provider_configured"] is True
+        assert diagnostics["model_provider_ready"] is available
+        assert diagnostics["model_provider"]["status"] == expected_status
+        assert diagnostics["model_provider"]["available"] is available
+    finally:
+        asyncio.run(application.shutdown())
+
+
 def test_operator_kill_switch_persists_and_environment_override_cannot_be_cleared(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
@@ -164,7 +201,10 @@ def test_startup_recovery_precedes_ready_and_uncertainty_blocks_scheduler(tmp_pa
     credential_store = ApiCredentialStore(tmp_path / "credentials.json")
     credential = credential_store.create({ApiScope.APPLICATION_READ, ApiScope.TASK_READ})
     application = AgentApplication(database)
-    status = application.start(api_credentials=credential_store)
+    status = application.start(
+        api_credentials=credential_store,
+        start_scheduler_on_api_start=True,
+    )
 
     assert status.state is ApplicationState.DEGRADED
     assert status.recovery_status == "blocked_uncertain_work"
@@ -178,6 +218,10 @@ def test_startup_recovery_precedes_ready_and_uncertainty_blocks_scheduler(tmp_pa
         status_response = client.get("/application/status", headers=_auth(credential.token))
         assert status_response.status_code == 200
         assert status_response.json()["state"] == "degraded"
+        assert application.service.scheduler_status().running is False
+        assert "application.scheduler_start_blocked_recovery" in {
+            event.event_type for event in application.store.audit_events()
+        }
         blocked = client.get("/tasks", headers=_auth(credential.token))
         assert blocked.status_code == 503
         assert blocked.json()["error"]["code"] == "APPLICATION_UNAVAILABLE"

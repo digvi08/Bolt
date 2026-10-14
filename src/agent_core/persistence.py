@@ -412,7 +412,7 @@ class TaskStateMachine:
         TaskStatus.RUNNING: {TaskStatus.EXECUTING, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.SUCCEEDED, TaskStatus.ABORTED},
         TaskStatus.WAITING_APPROVAL: {TaskStatus.AWAITING_APPROVAL, TaskStatus.DENIED, TaskStatus.STOPPED, TaskStatus.ABORTED},
         TaskStatus.AWAITING_APPROVAL: {TaskStatus.EXECUTING, TaskStatus.DENIED, TaskStatus.STOPPED, TaskStatus.ABORTED},
-        TaskStatus.EXECUTING: {TaskStatus.VERIFYING, TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.STOPPED},
+        TaskStatus.EXECUTING: {TaskStatus.VERIFYING, TaskStatus.AWAITING_APPROVAL, TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.STOPPED},
         TaskStatus.VERIFYING: {TaskStatus.SUCCEEDED, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.STOPPED},
         TaskStatus.RECOVERING: {TaskStatus.AWAITING_APPROVAL, TaskStatus.EXECUTING, TaskStatus.FAILED, TaskStatus.DENIED, TaskStatus.STOPPED, TaskStatus.SUCCEEDED},
         TaskStatus.SUCCEEDED: {

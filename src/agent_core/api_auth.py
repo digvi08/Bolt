@@ -50,6 +50,7 @@ class ApiScope(StrEnum):
     APPROVAL_APPROVE_ANY = "approval.approve:any"
     APPROVAL_DENY = "approval.deny"
     APPROVAL_DENY_ANY = "approval.deny:any"
+    SAFETY_CONTROL = "safety.control"
 
 
 @dataclass(frozen=True)
